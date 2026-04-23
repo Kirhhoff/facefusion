@@ -157,21 +157,22 @@ def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: s
     Use ffprobe to detect which frame numbers are keyframes (I-frames).
     Returns a set of 1-based frame indices matching the extracted frame_%08d.png naming.
     """
-    cmd = [
-        'ffprobe', '-v', 'error',
+    cmd = ['ffprobe', '-v', 'error']
+    
+    # Add time range options for better compatibility
+    if start_time:
+        cmd.extend(['-ss', start_time])
+    if end_time:
+        cmd.extend(['-to', end_time])
+    
+    # Add the rest of the ffprobe options
+    cmd.extend([
         '-select_streams', 'v:0',
         '-show_frames',
         '-show_entries', 'frame=pict_type',
         '-of', 'csv=p=0',
-    ]
-    
-    # Add time range options for better compatibility
-    if start_time:
-        cmd = cmd[:3] + ['-ss', start_time] + cmd[3:]
-    if end_time:
-        cmd = cmd[:3] + ['-to', end_time] + cmd[3:]
-
-    cmd.append(video_path)
+        video_path
+    ])
 
     out = run_cmd(cmd, capture=True)
     if not out:
