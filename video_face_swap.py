@@ -32,7 +32,7 @@ from glob import glob
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run_cmd(cmd: list[str], *, check: bool = True, capture: bool = False, **kwargs):
+def run_cmd(cmd: list, *, check: bool = True, capture: bool = False, **kwargs):
     """Run a command and optionally return stdout."""
     if capture:
         result = subprocess.run(cmd, check=check, capture_output=True, text=True, **kwargs)
@@ -93,7 +93,7 @@ def seconds_to_timecode(seconds: float) -> str:
 # Step 1: Extract frames & audio
 # ---------------------------------------------------------------------------
 
-def extract_frames(video_path: str, work_dir: str, start_time: str | None, end_time: str | None) -> tuple[str, str | None, float]:
+def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_time: str = None, turbo_mode: bool = False) -> tuple:
     """
     Extract video frames as PNG images and audio track.
     Returns (frames_dir, audio_path_or_None, fps).
@@ -152,7 +152,7 @@ def extract_frames(video_path: str, work_dir: str, start_time: str | None, end_t
 # Step 1.5: Detect keyframes and create symlink directories
 # ---------------------------------------------------------------------------
 
-def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: str | None) -> set[int]:
+def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: str = None) -> set:
     """
     Use ffprobe to detect which frame numbers are keyframes (I-frames).
     Returns a set of 1-based frame indices matching the extracted frame_%08d.png naming.
@@ -192,7 +192,7 @@ def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: s
         return set()
 
 
-def _build_ffprobe_interval(start_time: str | None, end_time: str | None) -> str:
+def _build_ffprobe_interval(start_time: str = None, end_time: str = None) -> str:
     """Build ffprobe -read_intervals value like '%+00:01:00' or '%00:00:10%00:00:30'."""
     # Handle None values properly
     start = start_time if start_time is not None else ''
@@ -210,7 +210,7 @@ def _build_ffprobe_interval(start_time: str | None, end_time: str | None) -> str
     return f'%{start}%+99999'
 
 
-def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set[int]):
+def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set):
     """
     Create keyframes_original/ with symlinks to original keyframes.
     Returns (keyframes_original_dir, list_of_keyframe_names).
@@ -236,7 +236,7 @@ def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set[int]
     return keyframes_orig_dir, keyframe_names
 
 
-def collect_swapped_keyframes(segments: list[dict], work_dir: str, keyframe_names: list[str]):
+def collect_swapped_keyframes(segments: list, work_dir: str, keyframe_names: list):
     """
     After face-swapping, symlink the swapped versions of keyframes into keyframes_swapped/.
     Zero extra computation — just picks from existing output.
@@ -263,7 +263,7 @@ def collect_swapped_keyframes(segments: list[dict], work_dir: str, keyframe_name
 # Step 2: Split frames into contiguous time-segments
 # ---------------------------------------------------------------------------
 
-def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -> list[dict]:
+def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -> list:
     """
     Split frames into N contiguous segments.
     Creates batch_N/ directories with symlinks.
@@ -329,7 +329,7 @@ def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -
 # Step 3 & 4: Launch workers with progress monitoring
 # ---------------------------------------------------------------------------
 
-def launch_workers(segments: list[dict], source_path: str, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 50) -> list[subprocess.Popen]:
+def launch_workers(segments: list, source_path: str, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300) -> list:
     """
     Launch FaceFusion worker subprocesses.
 
@@ -421,7 +421,7 @@ def launch_workers(segments: list[dict], source_path: str, config_path: str, fac
     return processes
 
 
-def monitor_progress(segments: list[dict], processes: list[subprocess.Popen]):
+def monitor_progress(segments: list, processes: list):
     """
     Monitor progress of each worker by counting output files.
     Each worker gets its own tqdm progress bar.
@@ -520,7 +520,7 @@ def monitor_progress(segments: list[dict], processes: list[subprocess.Popen]):
 # Step 5: Reassemble video
 # ---------------------------------------------------------------------------
 
-def reassemble_video(segments: list[dict], output_path: str, fps: float, audio_path: str | None, work_dir: str):
+def reassemble_video(segments: list, output_path: str, fps: float, audio_path: str = None, work_dir: str = None):
     """Collect all processed frames in order and encode back to video."""
     print('[Step 5] Reassembling video ...')
 
@@ -622,6 +622,7 @@ Examples:
     parser.add_argument('--work-base', default='.', help='Parent directory for the work folder (default: current dir)')
     parser.add_argument('--config-path', default='facefusion.ini', help='Path to FaceFusion config file (default: facefusion.ini)')
     parser.add_argument('--batch-size', type=int, default=300, help='Frames per mini-batch inside each worker (default: 300)')
+    parser.add_argument('--turbo-mode', action='store_true', help='Turbo mode: extract only keyframes and skip video reassembly for quick preview')
 
     args = parser.parse_args()
 
