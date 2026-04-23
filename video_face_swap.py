@@ -164,11 +164,12 @@ def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: s
         '-show_entries', 'frame=pict_type',
         '-of', 'csv=p=0',
     ]
-    # Apply time range to match the extracted frames
+    
+    # Add time range options for better compatibility
     if start_time:
-        cmd = cmd[:3] + ['-read_intervals', _build_ffprobe_interval(start_time, end_time)] + cmd[3:]
-    elif end_time:
-        cmd = cmd[:3] + ['-read_intervals', _build_ffprobe_interval(start_time, end_time)] + cmd[3:]
+        cmd = cmd[:3] + ['-ss', start_time] + cmd[3:]
+    if end_time:
+        cmd = cmd[:3] + ['-to', end_time] + cmd[3:]
 
     cmd.append(video_path)
 
@@ -186,10 +187,21 @@ def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: s
 
 
 def _build_ffprobe_interval(start_time: str | None, end_time: str | None) -> str:
-    """Build ffprobe -read_intervals value like '%+#30' or '%00:01:00%00:02:00'."""
-    start = start_time or ''
-    end = end_time or ''
-    return f'%{start}%{end}'
+    """Build ffprobe -read_intervals value like '%+00:01:00' or '%00:00:10%00:00:30'."""
+    # Handle None values properly
+    start = start_time if start_time is not None else ''
+    end = end_time if end_time is not None else ''
+
+    # When start is empty or the beginning of the video, use %+duration format
+    if not start or start == '00:00:00':
+        if end:
+            return f'%+{end}'
+        return '%+99999'  # effectively read all
+
+    if end:
+        return f'%{start}%{end}'
+
+    return f'%{start}%+99999'
 
 
 def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set[int]):
