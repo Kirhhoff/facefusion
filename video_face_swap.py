@@ -575,9 +575,8 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
         cmd += ['-i', audio_path, '-c:a', 'aac', '-shortest']
 
     cmd += [
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '18',
+        '-c:v', 'mpeg4',
+        '-qscale:v', '2',
         '-pix_fmt', 'yuv420p',
         output_path
     ]
