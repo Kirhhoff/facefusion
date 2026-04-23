@@ -621,7 +621,7 @@ Examples:
     parser.add_argument('--end-time', default=None, help='End time (HH:MM:SS or seconds)')
     parser.add_argument('--work-base', default='.', help='Parent directory for the work folder (default: current dir)')
     parser.add_argument('--config-path', default='facefusion.ini', help='Path to FaceFusion config file (default: facefusion.ini)')
-    parser.add_argument('--batch-size', type=int, default=50, help='Frames per mini-batch inside each worker (default: 50)')
+    parser.add_argument('--batch-size', type=int, default=300, help='Frames per mini-batch inside each worker (default: 300)')
 
     args = parser.parse_args()
 
