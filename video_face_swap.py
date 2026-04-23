@@ -174,17 +174,22 @@ def detect_keyframe_indices(video_path: str, start_time: str | None, end_time: s
         video_path
     ])
 
-    out = run_cmd(cmd, capture=True)
-    if not out:
+    try:
+        out = run_cmd(cmd, capture=True)
+        if not out:
+            return set()
+
+        keyframe_indices = set()
+        for i, line in enumerate(out.splitlines(), start=1):
+            pict_type = line.strip()
+            if pict_type == 'I':
+                keyframe_indices.add(i)
+
+        return keyframe_indices
+    except subprocess.CalledProcessError as e:
+        print(f"ffprobe command failed: {' '.join(cmd)}")
+        print(f"Error output: {e.stderr}")
         return set()
-
-    keyframe_indices = set()
-    for i, line in enumerate(out.splitlines(), start=1):
-        pict_type = line.strip()
-        if pict_type == 'I':
-            keyframe_indices.add(i)
-
-    return keyframe_indices
 
 
 def _build_ffprobe_interval(start_time: str | None, end_time: str | None) -> str:
