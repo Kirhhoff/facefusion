@@ -329,7 +329,7 @@ def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -
 # Step 3 & 4: Launch workers with progress monitoring
 # ---------------------------------------------------------------------------
 
-def launch_workers(segments: list, source_path: str, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300) -> list:
+def launch_workers(segments: list, source_path: str, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_debug: bool = False) -> list:
     """
     Launch FaceFusion worker subprocesses.
 
@@ -388,7 +388,8 @@ def launch_workers(segments: list, source_path: str, config_path: str, facefusio
                     f' -s "{source_abs}"'
                     f' -t "{target_pattern}"'
                     f' -o "{output_pattern}"'
-                    f'\n\n'
+                    + (' --face-debug' if face_debug else '')
+                    + '\n\n'
                 )
         os.chmod(script_path, 0o755)
 
@@ -622,6 +623,7 @@ Examples:
     parser.add_argument('--config-path', default='facefusion.ini', help='Path to FaceFusion config file (default: facefusion.ini)')
     parser.add_argument('--batch-size', type=int, default=300, help='Frames per mini-batch inside each worker (default: 300)')
     parser.add_argument('--turbo-mode', action='store_true', help='Turbo mode: extract only keyframes and skip video reassembly for quick preview')
+    parser.add_argument('--face-debug', action='store_true', help='Enable face detection debug prints in FaceFusion workers')
 
     args = parser.parse_args()
 
@@ -689,7 +691,7 @@ Examples:
     segments = split_frames_into_segments(frames_dir, work_dir, args.workers)
 
     # Step 3: Launch workers
-    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size)
+    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size, face_debug=args.face_debug)
 
     # Step 4: Monitor progress
     print(f'[Step 4] Monitoring progress ...')

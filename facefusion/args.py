@@ -28,6 +28,7 @@ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
 	apply_state_item('face_selector_order', args.get('face_selector_order'))
 	apply_state_item('face_selector_age_start', args.get('face_selector_age_start'))
 	apply_state_item('face_selector_age_end', args.get('face_selector_age_end'))
+	apply_state_item('face_debug', args.get('face_debug'))
 	apply_state_item('face_selector_gender', args.get('face_selector_gender'))
 	apply_state_item('face_selector_race', args.get('face_selector_race'))
 	apply_state_item('reference_face_position', args.get('reference_face_position'))
