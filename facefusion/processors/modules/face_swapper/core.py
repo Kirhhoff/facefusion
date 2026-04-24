@@ -755,16 +755,16 @@ def extract_source_face(source_vision_frames : List[VisionFrame]) -> Optional[Fa
 				source_faces.append(get_first(temp_faces))
 
 		face_detector_score_threshold = state_manager.get_item('face_detector_score')
-		if state_manager.get_item('face_debug'):
+		if state_manager.get_item('face_swap_debug'):
 			detected_scores = [ f.score_set.get('detector') for f in temp_faces ] if temp_faces else []
 			print(f'[FACE_DEBUG] source image: detected {len(temp_faces)} face(s), detector_scores={detected_scores}, threshold={face_detector_score_threshold}')
 
 	result = get_average_face(source_faces)
 	if result:
-		if state_manager.get_item('face_debug'):
+		if state_manager.get_item('face_swap_debug'):
 			print(f'[FACE_DEBUG] source image: selected source_face with detector_score={result.score_set.get("detector"):.4f}')
 	else:
-		if state_manager.get_item('face_debug'):
+		if state_manager.get_item('face_swap_debug'):
 			print(f'[FACE_DEBUG] source image: NO source face extracted! (0 faces detected above threshold)')
 	return result
 
@@ -780,7 +780,7 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 
 	face_selector_mode = state_manager.get_item('face_selector_mode')
 	face_detector_score_threshold = state_manager.get_item('face_detector_score')
-	if state_manager.get_item('face_debug'):
+	if state_manager.get_item('face_swap_debug'):
 		all_target_faces = get_many_faces([target_vision_frame])
 		all_target_scores = [ f.score_set.get('detector') for f in all_target_faces ] if all_target_faces else []
 		print(f'[FACE_DEBUG] target frame: face_selector_mode={face_selector_mode}, all_detected={len(all_target_faces)}, all_scores={all_target_scores}, threshold={face_detector_score_threshold}, selected={len(target_faces)}')
@@ -788,15 +788,15 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
 	if source_face and target_faces:
 		for target_face in target_faces:
 			target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
-			if state_manager.get_item('face_debug'):
+			if state_manager.get_item('face_swap_debug'):
 				pre_swap = temp_vision_frame.copy()
 			temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame)
-			if state_manager.get_item('face_debug'):
+			if state_manager.get_item('face_swap_debug'):
 				pixel_diff = numpy.abs(temp_vision_frame.astype(numpy.float32) - pre_swap.astype(numpy.float32)).mean()
 				pixel_max_diff = numpy.abs(temp_vision_frame.astype(numpy.float32) - pre_swap.astype(numpy.float32)).max()
 				print(f'[FACE_DEBUG] swap_face done: mean_pixel_diff={pixel_diff:.4f}, max_pixel_diff={pixel_max_diff:.1f}, weight={state_manager.get_item("face_swapper_weight")}')
 	else:
-		if state_manager.get_item('face_debug'):
+		if state_manager.get_item('face_swap_debug'):
 			reasons = []
 			if not source_face:
 				reasons.append('no source face')
