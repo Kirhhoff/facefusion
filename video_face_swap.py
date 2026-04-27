@@ -100,15 +100,17 @@ def seconds_to_timecode(seconds: float) -> str:
 
 def _read_config_step_args(config_path: str) -> dict:
     """
-    Read step-level args from facefusion.ini so that they are present in the
-    job JSON.  Without this, FaceFusion's ``apply_args(step_args, state_manager.set_item)``
-    would call ``args.get('face_swapper_model')`` → ``None`` and **overwrite** the
-    default value that was set by ``init_item`` during CLI parsing.
+    Read **all** step-level args from facefusion.ini so that they are present in
+    the job JSON.  Without this, FaceFusion's ``apply_args(step_args,
+    state_manager.set_item)`` would call ``args.get('face_swapper_model')`` →
+    ``None`` and **overwrite** the default value that was set by ``init_item``
+    during CLI parsing.
 
-    We only need to include keys whose *absence* would cause a crash or
-    unwanted behaviour.  The values come from the same config file that the
-    worker process will read via ``--config-path``, so they are guaranteed
-    to be consistent.
+    Instead of hard-coding individual keys, this function reads every non-empty
+    key-value pair from the step-relevant INI sections and performs automatic
+    type inference so that the values match what ``argparse`` would normally
+    produce.  This way, any future parameter added to ``facefusion.ini`` will
+    be picked up automatically — no code change required.
 
     Parameters
     ----------
@@ -123,123 +125,115 @@ def _read_config_step_args(config_path: str) -> dict:
     cp = ConfigParser()
     cp.read(config_path, encoding='utf-8')
 
-    step_args: dict = {}
-
-    # --- Processors section ---
-    proc_section = 'processors'
-    # Numeric keys that need type conversion (argparse would normally do this)
-    proc_numeric_keys = {
-        'face_swapper_weight': float,
-    }
-    processor_keys = [
-        'face_swapper_model',
-        'face_swapper_pixel_boost',
-        'face_swapper_weight',
+    # Sections that contain step-level configuration (i.e. keys registered via
+    # ``register_step_keys`` in FaceFusion).  Sections like [execution],
+    # [memory], [uis], [download], [benchmark], [misc] are job-level and will
+    # be handled by the worker's own ``--config-path`` flag, so we skip them.
+    STEP_SECTIONS = [
+        'face_detector',
+        'face_landmarker',
+        'face_selector',
+        'face_masker',
+        'voice_extractor',
+        'frame_extraction',
+        'output_creation',
+        'processors',
     ]
-    for key in processor_keys:
-        if cp.has_option(proc_section, key) and cp.get(proc_section, key).strip():
-            val = cp.get(proc_section, key).strip()
-            if key in proc_numeric_keys:
-                try:
-                    step_args[key] = proc_numeric_keys[key](val)
-                except (ValueError, TypeError):
-                    step_args[key] = val
-            else:
-                step_args[key] = val
 
-    # --- Face detector section ---
-    det_section = 'face_detector'
-    det_numeric_keys = {
-        'face_detector_score': float,
+    # Keys that we set manually when building step args — they should NOT be
+    # overwritten by config values.
+    MANUAL_KEYS = {
+        'source_paths',
+        'target_path',
+        'output_path',
+        'processors',
     }
-    det_keys = [
-        'face_detector_model',
-        'face_detector_size',
-        'face_detector_margin',
-        'face_detector_angles',
-        'face_detector_score',
-    ]
-    for key in det_keys:
-        if cp.has_option(det_section, key) and cp.get(det_section, key).strip():
-            val = cp.get(det_section, key).strip()
-            if key in det_numeric_keys:
-                try:
-                    step_args[key] = det_numeric_keys[key](val)
-                except (ValueError, TypeError):
-                    step_args[key] = val
-            elif ' ' in val:
-                # Convert space-separated lists to actual lists (e.g. "0 90 180 270")
-                step_args[key] = val.split()
-            else:
-                step_args[key] = val
 
-    # --- Face landmarker section ---
-    land_section = 'face_landmarker'
-    land_numeric_keys = {
-        'face_landmarker_score': float,
-    }
-    land_keys = [
-        'face_landmarker_model',
-        'face_landmarker_score',
-    ]
-    for key in land_keys:
-        if cp.has_option(land_section, key) and cp.get(land_section, key).strip():
-            val = cp.get(land_section, key).strip()
-            if key in land_numeric_keys:
-                try:
-                    step_args[key] = land_numeric_keys[key](val)
-                except (ValueError, TypeError):
-                    step_args[key] = val
-            else:
-                step_args[key] = val
+    # Suffixes that indicate a float value (matching FaceFusion's
+    # ``register_args`` conventions where ``type = float`` is used).
+    FLOAT_SUFFIXES = (
+        '_score',
+        '_distance',
+        '_weight',
+        '_factor',
+        '_blend',
+        '_blur',
+        '_scale',
+        '_fps',
+        '_direction',
+        '_volume',
+        '_morph',
+    )
 
-    # --- Face selector section ---
-    sel_section = 'face_selector'
-    sel_numeric_keys = {
-        'reference_face_distance': float,
-    }
-    sel_keys = [
-        'face_selector_mode',
+    # Suffixes that indicate an int value (``type = int`` in register_args).
+    INT_SUFFIXES = (
+        '_margin',
+        '_angles',
+        '_start',
+        '_end',
+        '_quality',
+        '_count',
+        '_position',
+        '_frame_number',
+        '_thread_count',
+        '_limit',
+        '_age_start',
+        '_age_end',
+        '_padding',
+        '_device_ids',
+    )
+
+    # Known list-type keys where ``nargs = '+'`` and items are strings.
+    STR_LIST_KEYS = {
+        'face_mask_types',
+        'face_mask_areas',
+        'face_mask_regions',
         'face_selector_order',
         'face_selector_gender',
         'face_selector_race',
-        'reference_face_distance',
-    ]
-    for key in sel_keys:
-        if cp.has_option(sel_section, key) and cp.get(sel_section, key).strip():
-            val = cp.get(sel_section, key).strip()
-            if key in sel_numeric_keys:
-                try:
-                    step_args[key] = sel_numeric_keys[key](val)
-                except (ValueError, TypeError):
-                    step_args[key] = val
-            else:
-                step_args[key] = val
-
-    # --- Face masker section ---
-    mask_section = 'face_masker'
-    mask_numeric_keys = {
-        'face_mask_blur': float,
+        'face_debugger_items',
+        'expression_restorer_areas',
     }
-    mask_keys = [
-        'face_occluder_model',
-        'face_parser_model',
-        'face_mask_types',
-        'face_mask_blur',
+
+    # Known list-type keys where ``nargs = '+'`` and items are ints.
+    INT_LIST_KEYS = {
+        'face_detector_angles',
+        'face_detector_margin',
         'face_mask_padding',
-    ]
-    for key in mask_keys:
-        if cp.has_option(mask_section, key) and cp.get(mask_section, key).strip():
-            val = cp.get(mask_section, key).strip()
-            if key in mask_numeric_keys:
+        'execution_device_ids',
+    }
+
+    step_args: dict = {}
+
+    for section in STEP_SECTIONS:
+        if not cp.has_section(section):
+            continue
+        for key in cp.options(section):
+            if key in MANUAL_KEYS:
+                continue
+            raw = cp.get(section, key).strip()
+            if not raw:
+                # Empty value in INI → skip (FaceFusion will use its built-in default)
+                continue
+
+            # ---- Type inference ----
+            if key in INT_LIST_KEYS:
+                step_args[key] = [int(x) for x in raw.split()]
+            elif key in STR_LIST_KEYS:
+                step_args[key] = raw.split()
+            elif key in INT_SUFFIXES and any(key.endswith(s) for s in INT_SUFFIXES):
                 try:
-                    step_args[key] = mask_numeric_keys[key](val)
-                except (ValueError, TypeError):
-                    step_args[key] = val
-            elif ' ' in val and key not in ('face_mask_blur',):
-                step_args[key] = val.split()
+                    step_args[key] = int(raw)
+                except ValueError:
+                    step_args[key] = raw
+            elif any(key.endswith(s) for s in FLOAT_SUFFIXES):
+                try:
+                    step_args[key] = float(raw)
+                except ValueError:
+                    step_args[key] = raw
             else:
-                step_args[key] = val
+                # Default: keep as string (model names, modes, etc.)
+                step_args[key] = raw
 
     return step_args
 
