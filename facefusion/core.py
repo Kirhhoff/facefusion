@@ -10,7 +10,7 @@ from facefusion.args import apply_args, collect_job_args, reduce_job_args, reduc
 from facefusion.download import conditional_download_hashes, conditional_download_sources
 from facefusion.exit_helper import hard_exit, signal_exit
 from facefusion.filesystem import get_file_extension, get_file_name, is_image, is_video, resolve_file_paths, resolve_file_pattern
-from facefusion.jobs import job_helper, job_manager, job_runner
+from facefusion.jobs import job_helper, job_manager, job_runner, job_store
 from facefusion.jobs.job_list import compose_job_list
 from facefusion.memory import limit_system_memory
 from facefusion.processors.core import get_processors_modules
@@ -324,6 +324,17 @@ def process_batch(args : Args) -> ErrorCode:
 def process_step(job_id : str, step_index : int, step_args : Args) -> bool:
 	step_total = job_manager.count_step_total(job_id)
 	step_args.update(collect_job_args())
+	# Fill in any step keys that are missing from step_args with their
+	# current state_manager values (set by init_item during CLI parsing).
+	# Without this, apply_args would call args.get('some_key') → None and
+	# overwrite the default with None, causing crashes like:
+	#   AttributeError: 'NoneType' object has no attribute 'get'
+	#   TypeError: 'NoneType' object is not subscriptable
+	for step_key in job_store.get_step_keys():
+		if step_key not in step_args or step_args.get(step_key) is None:
+			current_value = state_manager.get_item(step_key)
+			if current_value is not None:
+				step_args[step_key] = current_value
 	apply_args(step_args, state_manager.set_item)
 
 	logger.info(translator.get('processing_step').format(step_current = step_index + 1, step_total = step_total), __name__)

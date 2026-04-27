@@ -32,7 +32,6 @@ import os
 import subprocess
 import sys
 import time
-from configparser import ConfigParser
 from datetime import datetime
 from glob import glob
 
@@ -100,140 +99,67 @@ def seconds_to_timecode(seconds: float) -> str:
 
 def _read_config_step_args(config_path: str) -> dict:
     """
-    Read **all** step-level args from facefusion.ini so that they are present in
-    the job JSON.  Without this, FaceFusion's ``apply_args(step_args,
-    state_manager.set_item)`` would call ``args.get('face_swapper_model')`` →
-    ``None`` and **overwrite** the default value that was set by ``init_item``
-    during CLI parsing.
+    Obtain **all** step-level args with their proper defaults by leveraging
+    FaceFusion's own ``create_program().parse_args()``.
 
-    Instead of hard-coding individual keys, this function reads every non-empty
-    key-value pair from the step-relevant INI sections and performs automatic
-    type inference so that the values match what ``argparse`` would normally
-    produce.  This way, any future parameter added to ``facefusion.ini`` will
-    be picked up automatically — no code change required.
+    The root cause of the ``'NoneType' object has no attribute 'get'`` /
+    ``'NoneType' object is not subscriptable`` errors is that
+    ``apply_args(step_args, state_manager.set_item)`` calls
+    ``args.get('some_key')`` for **every** step key.  If the key is missing
+    from ``step_args``, ``dict.get()`` returns ``None``, and
+    ``state_manager.set_item`` **overwrites** the default that was set by
+    ``init_item`` during CLI parsing.
+
+    Simply reading non-empty values from ``facefusion.ini`` is insufficient
+    because many INI keys are intentionally left empty (meaning "use the
+    built-in default"), and those empty keys would be skipped — leaving the
+    step_args dict incomplete.
+
+    The fix: call FaceFusion's own ``create_program().parse_args()`` with a
+    minimal argument list.  This triggers the full argparse pipeline which:
+      1. Reads ``facefusion.ini`` via the ``config.get_*`` helpers
+      2. Falls back to hard-coded defaults for empty INI entries
+      3. Returns a complete namespace with **every** key populated
+
+    We then filter down to step-level keys via ``reduce_step_args`` and
+    return the result.  This way, *every* step key has a proper value — no
+    ``None`` overwrites, and no maintenance of key/type lists is needed.
 
     Parameters
     ----------
     config_path : str
-        Path to ``facefusion.ini``.
+        Path to ``facefusion.ini`` (used as ``--config-path`` for argparse).
 
     Returns
     -------
     dict
-        Step args dict with config-derived values.
+        Complete step args dict with all keys populated.
     """
-    cp = ConfigParser()
-    cp.read(config_path, encoding='utf-8')
+    # Late import so this module can be loaded without the facefusion
+    # package on PYTHONPATH during development / testing.
+    from facefusion.program import create_program
+    from facefusion.args import reduce_step_args
 
-    # Sections that contain step-level configuration (i.e. keys registered via
-    # ``register_step_keys`` in FaceFusion).  Sections like [execution],
-    # [memory], [uis], [download], [benchmark], [misc] are job-level and will
-    # be handled by the worker's own ``--config-path`` flag, so we skip them.
-    STEP_SECTIONS = [
-        'face_detector',
-        'face_landmarker',
-        'face_selector',
-        'face_masker',
-        'voice_extractor',
-        'frame_extraction',
-        'output_creation',
-        'processors',
-    ]
+    # Parse with minimal args — argparse fills in every default, pulling
+    # from facefusion.ini for non-empty entries and using hard-coded
+    # fallbacks for empty ones.
+    program = create_program()
+    known_args, _ = program.parse_known_args([
+        'headless-run',
+        '--config-path', config_path,
+        '--source-paths', '__placeholder__',
+        '--target-path',   '__placeholder__',
+        '--output-path',   '__placeholder__',
+    ])
+    args_dict = vars(known_args)
 
-    # Keys that we set manually when building step args — they should NOT be
-    # overwritten by config values.
-    MANUAL_KEYS = {
-        'source_paths',
-        'target_path',
-        'output_path',
-        'processors',
-    }
+    # Filter to step-level keys only
+    step_args = reduce_step_args(args_dict)
 
-    # Suffixes that indicate a float value (matching FaceFusion's
-    # ``register_args`` conventions where ``type = float`` is used).
-    FLOAT_SUFFIXES = (
-        '_score',
-        '_distance',
-        '_weight',
-        '_factor',
-        '_blend',
-        '_blur',
-        '_scale',
-        '_fps',
-        '_direction',
-        '_volume',
-        '_morph',
-    )
-
-    # Suffixes that indicate an int value (``type = int`` in register_args).
-    INT_SUFFIXES = (
-        '_margin',
-        '_angles',
-        '_start',
-        '_end',
-        '_quality',
-        '_count',
-        '_position',
-        '_frame_number',
-        '_thread_count',
-        '_limit',
-        '_age_start',
-        '_age_end',
-        '_padding',
-        '_device_ids',
-    )
-
-    # Known list-type keys where ``nargs = '+'`` and items are strings.
-    STR_LIST_KEYS = {
-        'face_mask_types',
-        'face_mask_areas',
-        'face_mask_regions',
-        'face_selector_order',
-        'face_selector_gender',
-        'face_selector_race',
-        'face_debugger_items',
-        'expression_restorer_areas',
-    }
-
-    # Known list-type keys where ``nargs = '+'`` and items are ints.
-    INT_LIST_KEYS = {
-        'face_detector_angles',
-        'face_detector_margin',
-        'face_mask_padding',
-        'execution_device_ids',
-    }
-
-    step_args: dict = {}
-
-    for section in STEP_SECTIONS:
-        if not cp.has_section(section):
-            continue
-        for key in cp.options(section):
-            if key in MANUAL_KEYS:
-                continue
-            raw = cp.get(section, key).strip()
-            if not raw:
-                # Empty value in INI → skip (FaceFusion will use its built-in default)
-                continue
-
-            # ---- Type inference ----
-            if key in INT_LIST_KEYS:
-                step_args[key] = [int(x) for x in raw.split()]
-            elif key in STR_LIST_KEYS:
-                step_args[key] = raw.split()
-            elif key in INT_SUFFIXES and any(key.endswith(s) for s in INT_SUFFIXES):
-                try:
-                    step_args[key] = int(raw)
-                except ValueError:
-                    step_args[key] = raw
-            elif any(key.endswith(s) for s in FLOAT_SUFFIXES):
-                try:
-                    step_args[key] = float(raw)
-                except ValueError:
-                    step_args[key] = raw
-            else:
-                # Default: keep as string (model names, modes, etc.)
-                step_args[key] = raw
+    # Remove the keys we set manually per-step so they don't collide.
+    # (source_paths / target_path / output_path contain placeholder values.)
+    for _key in ('source_paths', 'target_path', 'output_path', 'processors'):
+        step_args.pop(_key, None)
 
     return step_args
 
