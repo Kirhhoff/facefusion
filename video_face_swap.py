@@ -281,14 +281,68 @@ def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_t
 
 
 def _count_frames_in_range(video_path: str, start_time: str = None, end_time: str = None) -> int:
-    """Count total number of video frames in the specified time range using ffprobe."""
+    """Count total number of video frames in the specified time range.
+
+    Uses a fast two-step approach instead of ``-show_frames`` (which decodes
+    every frame and is extremely slow for long videos):
+
+    1. If the container reports ``nb_frames`` for the video stream, use that
+       directly (instant, no decoding).
+    2. Otherwise fall back to ``-show_packets`` (packet headers only, no
+       decoding) and count packets whose pts_time falls within the range.
+
+    When no time range is specified and ``nb_frames`` is available, the
+    result is returned immediately without any additional ffprobe call.
+    """
     start_sec = time_to_seconds(start_time) if start_time else None
     end_sec = time_to_seconds(end_time) if end_time else None
 
+    # Fast path: try to get nb_frames from stream metadata (no decoding)
+    try:
+        out = run_cmd([
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=nb_frames,duration',
+            '-of', 'json',
+            video_path
+        ], capture=True)
+        info = json.loads(out)
+        stream = info.get('streams', [{}])[0]
+        nb_frames_str = stream.get('nb_frames', '')
+
+        if nb_frames_str and not start_time and not end_time:
+            # No time range — nb_frames is the exact answer
+            return int(nb_frames_str)
+
+        # If we have nb_frames and a time range, estimate by proportion
+        if nb_frames_str:
+            total_frames = int(nb_frames_str)
+            duration_str = stream.get('duration', '')
+            if duration_str:
+                try:
+                    total_duration = float(duration_str)
+                except (ValueError, TypeError):
+                    total_duration = get_video_duration(video_path)
+            else:
+                total_duration = get_video_duration(video_path)
+
+            if total_duration > 0:
+                range_start = start_sec if start_sec is not None else 0.0
+                range_end = end_sec if end_sec is not None else total_duration
+                range_duration = range_end - range_start
+                if range_duration <= 0:
+                    return 0
+                # Proportional estimate
+                return max(1, round(total_frames * range_duration / total_duration))
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError, KeyError):
+        pass
+
+    # Fallback: count video packets (fast — no decoding, just container parsing)
     cmd = [
         'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries', 'frame=pts_time,pict_type',
+        '-show_packets',
+        '-show_entries', 'packet=pts_time',
         '-of', 'json',
         video_path,
     ]
@@ -298,10 +352,10 @@ def _count_frames_in_range(video_path: str, start_time: str = None, end_time: st
         if not out:
             return 0
         probe_data = json.loads(out)
-        frames = probe_data.get('frames', [])
+        packets = probe_data.get('packets', [])
         count = 0
-        for frame in frames:
-            pts_time_str = frame.get('pts_time', '')
+        for pkt in packets:
+            pts_time_str = pkt.get('pts_time', '')
             try:
                 pts_time = float(pts_time_str)
             except (ValueError, TypeError):
@@ -324,23 +378,34 @@ def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: s
     """
     Use ffprobe to detect which frames are keyframes (I-frames).
 
-    Strategy: query the *entire* video with ffprobe (no -ss/-to seek) so that
-    frame indices and timestamps are stable and aligned with the source video.
-    Then filter by time range if start_time/end_time are specified.
+    Strategy: use ``-show_packets`` instead of ``-show_frames``.
+    ``-show_frames`` decodes every frame which is extremely slow for long
+    videos (can take hours for a 2-hour 1080p HEVC file).  ``-show_packets``
+    only reads container-level packet metadata — no decoding required — and
+    is typically 50-100× faster.
+
+    Key-frames are identified by the ``K`` flag in the packet's ``flags``
+    field (``flags=K_`` means key-frame).
+
+    Frame-index alignment
+    ---------------------
+    Packets are enumerated in decode order starting from 1 so that the
+    indices align with the extracted frame numbering
+    (``frame_00000001.png`` is index 1).
 
     Returns
     -------
     tuple of (set, dict)
-        - keyframe_indices : set of 1-based frame indices (aligned with extracted
-          frame numbering: frame_00000001.png is index 1).
+        - keyframe_indices : set of 1-based frame indices.
         - keyframe_info : dict mapping 1-based index → pts_time (float seconds)
-          for every keyframe.  Useful for timestamp-based matching in turbo mode.
+          for every keyframe.
     """
+    # Use -show_packets with compact output for fast parsing
     cmd = [
         'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_frames',
-        '-show_entries', 'frame=pts_time,pict_type',
+        '-show_packets',
+        '-show_entries', 'packet=pts_time,flags',
         '-of', 'json',
         video_path,
     ]
@@ -362,9 +427,9 @@ def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: s
         print(f'[Warning] ffprobe output is not valid JSON: {e}')
         return set(), {}
 
-    frames = probe_data.get('frames', [])
-    if not frames:
-        print('[Warning] ffprobe returned no frame entries — cannot detect keyframes')
+    packets = probe_data.get('packets', [])
+    if not packets:
+        print('[Warning] ffprobe returned no packet entries — cannot detect keyframes')
         return set(), {}
 
     # Determine time-range boundaries (in seconds)
@@ -374,14 +439,15 @@ def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: s
     keyframe_indices = set()
     keyframe_info = {}
 
-    for i, frame in enumerate(frames, start=1):
-        pict_type = frame.get('pict_type', '')
-        pts_time_str = frame.get('pts_time', '')
+    for i, pkt in enumerate(packets, start=1):
+        flags = pkt.get('flags', '')
+        pts_time_str = pkt.get('pts_time', '')
 
-        if pict_type != 'I':
+        # Key-frame packets have 'K' in their flags field
+        if 'K' not in flags:
             continue
 
-        # Parse pts_time — skip frames with invalid/missing timestamps
+        # Parse pts_time — skip packets with invalid/missing timestamps
         try:
             pts_time = float(pts_time_str)
         except (ValueError, TypeError):
