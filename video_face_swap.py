@@ -171,141 +171,326 @@ def _read_config_step_args(config_path: str) -> dict:
 def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_time: str = None, turbo_mode: bool = False) -> tuple:
     """
     Extract video frames as PNG images and audio track.
-    Returns (frames_dir, audio_path_or_None, fps).
-    """
-    frames_dir = os.path.join(work_dir, 'frames')
-    os.makedirs(frames_dir, exist_ok=True)
 
+    In normal mode: extracts ALL frames to ``frames/``.
+    In turbo mode:  extracts ONLY keyframes (I-frames) to ``keyframes_original/``.
+
+    Returns
+    -------
+    tuple
+        Normal mode:  (frames_dir, audio_path_or_None, fps)
+        Turbo mode:   (keyframes_original_dir, None, fps, keyframe_count, total_frame_count)
+
+        The turbo-mode return has 5 elements so callers can distinguish
+        the two cases via ``len(result)``.
+    """
     fps = get_video_fps(video_path)
     print(f'[Info] Detected video FPS: {fps:.3f}')
 
-    # --- Extract frames ---
-    cmd = ['ffmpeg', '-y']
-    if start_time:
-        cmd += ['-ss', start_time]
-    if end_time:
-        cmd += ['-to', end_time]
-    cmd += [
-        '-i', video_path,
-        '-vsync', '0',
-        '-qmin', '1', '-q:v', '1',  # high quality PNG
-        os.path.join(frames_dir, 'frame_%08d.png')
-    ]
-    print(f'[Step 1] Extracting frames ...')
-    run_cmd(cmd)
+    if turbo_mode:
+        # ---- Turbo mode: extract only keyframes (I-frames) ----
+        keyframes_dir = os.path.join(work_dir, 'keyframes_original')
+        os.makedirs(keyframes_dir, exist_ok=True)
 
-    frame_count = len(glob(os.path.join(frames_dir, 'frame_*.png')))
-    print(f'[Step 1] Extracted {frame_count} frames')
+        # Use ffmpeg select filter to extract only I-frames
+        # The select filter evaluates for each frame; eq(pict_type\,I) keeps I-frames
+        cmd = ['ffmpeg', '-y']
+        if start_time:
+            cmd += ['-ss', start_time]
+        if end_time:
+            cmd += ['-to', end_time]
+        cmd += [
+            '-i', video_path,
+            '-vf', "select=eq(pict_type\\,I)",
+            '-vsync', 'vfr',
+            '-qmin', '1', '-q:v', '1',  # high quality PNG
+            os.path.join(keyframes_dir, 'frame_%08d.png')
+        ]
+        print(f'[Step 1] [Turbo Mode] Extracting keyframes (I-frames) ...')
+        run_cmd(cmd)
 
-    # --- Extract audio ---
-    audio_path = os.path.join(work_dir, 'audio.aac')
-    cmd_audio = ['ffmpeg', '-y']
-    if start_time:
-        cmd_audio += ['-ss', start_time]
-    if end_time:
-        cmd_audio += ['-to', end_time]
-    cmd_audio += [
-        '-i', video_path,
-        '-vn', '-acodec', 'copy',
-        audio_path
-    ]
-    try:
-        run_cmd(cmd_audio, check=True)
-        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+        keyframe_count = len(glob(os.path.join(keyframes_dir, 'frame_*.png')))
+        print(f'[Step 1] [Turbo Mode] Extracted {keyframe_count} keyframes')
+
+        if keyframe_count == 0:
+            print('[Warning] No keyframes extracted! The video may not contain I-frames '
+                  'or the specified time range may have no keyframes.')
+            if start_time or end_time:
+                print(f'  Time range: {start_time or "start"} ~ {end_time or "end"}')
+            print('[Info] Try adjusting the time range or check the video file.')
+            # Return with empty result so caller can handle gracefully
+            return keyframes_dir, None, fps, 0, 0
+
+        # Compute total frame count in the specified range for statistics
+        total_frame_count = _count_frames_in_range(video_path, start_time, end_time)
+        if total_frame_count == 0:
+            total_frame_count = keyframe_count  # fallback
+
+        pct = 100 * keyframe_count / max(total_frame_count, 1)
+        print(f'[Step 1] [Turbo Mode] Keyframes represent {pct:.1f}% of {total_frame_count} total frames')
+
+        return keyframes_dir, None, fps, keyframe_count, total_frame_count
+
+    else:
+        # ---- Normal mode: extract ALL frames ----
+        frames_dir = os.path.join(work_dir, 'frames')
+        os.makedirs(frames_dir, exist_ok=True)
+
+        # --- Extract frames ---
+        cmd = ['ffmpeg', '-y']
+        if start_time:
+            cmd += ['-ss', start_time]
+        if end_time:
+            cmd += ['-to', end_time]
+        cmd += [
+            '-i', video_path,
+            '-vsync', '0',
+            '-qmin', '1', '-q:v', '1',  # high quality PNG
+            os.path.join(frames_dir, 'frame_%08d.png')
+        ]
+        print(f'[Step 1] Extracting frames ...')
+        run_cmd(cmd)
+
+        frame_count = len(glob(os.path.join(frames_dir, 'frame_*.png')))
+        print(f'[Step 1] Extracted {frame_count} frames')
+
+        # --- Extract audio ---
+        audio_path = os.path.join(work_dir, 'audio.aac')
+        cmd_audio = ['ffmpeg', '-y']
+        if start_time:
+            cmd_audio += ['-ss', start_time]
+        if end_time:
+            cmd_audio += ['-to', end_time]
+        cmd_audio += [
+            '-i', video_path,
+            '-vn', '-acodec', 'copy',
+            audio_path
+        ]
+        try:
+            run_cmd(cmd_audio, check=True)
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                audio_path = None
+                print('[Step 1] No audio track found or audio is empty')
+            else:
+                print(f'[Step 1] Audio extracted to {audio_path}')
+        except subprocess.CalledProcessError:
             audio_path = None
-            print('[Step 1] No audio track found or audio is empty')
-        else:
-            print(f'[Step 1] Audio extracted to {audio_path}')
-    except subprocess.CalledProcessError:
-        audio_path = None
-        print('[Step 1] No audio track found, skipping')
+            print('[Step 1] No audio track found, skipping')
 
-    return frames_dir, audio_path, fps
+        return frames_dir, audio_path, fps
+
+
+def _count_frames_in_range(video_path: str, start_time: str = None, end_time: str = None) -> int:
+    """Count total number of video frames in the specified time range using ffprobe."""
+    start_sec = time_to_seconds(start_time) if start_time else None
+    end_sec = time_to_seconds(end_time) if end_time else None
+
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'frame=pts_time,pict_type',
+        '-of', 'json',
+        video_path,
+    ]
+
+    try:
+        out = run_cmd(cmd, capture=True)
+        if not out:
+            return 0
+        probe_data = json.loads(out)
+        frames = probe_data.get('frames', [])
+        count = 0
+        for frame in frames:
+            pts_time_str = frame.get('pts_time', '')
+            try:
+                pts_time = float(pts_time_str)
+            except (ValueError, TypeError):
+                continue
+            if start_sec is not None and pts_time < start_sec:
+                continue
+            if end_sec is not None and pts_time > end_sec:
+                continue
+            count += 1
+        return count
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
 # Step 1.5: Detect keyframes and create symlink directories
 # ---------------------------------------------------------------------------
 
-def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: str = None) -> set:
+def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: str = None) -> tuple:
     """
-    Use ffprobe to detect which frame numbers are keyframes (I-frames).
-    Returns a set of 1-based frame indices matching the extracted frame_%08d.png naming.
+    Use ffprobe to detect which frames are keyframes (I-frames).
+
+    Strategy: query the *entire* video with ffprobe (no -ss/-to seek) so that
+    frame indices and timestamps are stable and aligned with the source video.
+    Then filter by time range if start_time/end_time are specified.
+
+    Returns
+    -------
+    tuple of (set, dict)
+        - keyframe_indices : set of 1-based frame indices (aligned with extracted
+          frame numbering: frame_00000001.png is index 1).
+        - keyframe_info : dict mapping 1-based index → pts_time (float seconds)
+          for every keyframe.  Useful for timestamp-based matching in turbo mode.
     """
-    cmd = ['ffprobe', '-v', 'error']
-    
-    # Add time range options for better compatibility
-    if start_time:
-        cmd.extend(['-ss', start_time])
-    if end_time:
-        cmd.extend(['-to', end_time])
-    
-    # Add the rest of the ffprobe options
-    cmd.extend([
+    cmd = [
+        'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
         '-show_frames',
-        '-show_entries', 'frame=pict_type',
-        '-of', 'csv=p=0',
-        video_path
-    ])
+        '-show_entries', 'frame=pts_time,pict_type',
+        '-of', 'json',
+        video_path,
+    ]
 
     try:
         out = run_cmd(cmd, capture=True)
-        if not out:
-            return set()
-
-        keyframe_indices = set()
-        for i, line in enumerate(out.splitlines(), start=1):
-            pict_type = line.strip()
-            if pict_type == 'I':
-                keyframe_indices.add(i)
-
-        return keyframe_indices
     except subprocess.CalledProcessError as e:
-        print(f"ffprobe command failed: {' '.join(cmd)}")
-        print(f"Error output: {e.stderr}")
-        return set()
+        print(f'[Warning] ffprobe command failed: {" ".join(cmd)}')
+        print(f'  Error: {e}')
+        return set(), {}
+
+    if not out:
+        print('[Warning] ffprobe returned empty output — no keyframe information available')
+        return set(), {}
+
+    try:
+        probe_data = json.loads(out)
+    except json.JSONDecodeError as e:
+        print(f'[Warning] ffprobe output is not valid JSON: {e}')
+        return set(), {}
+
+    frames = probe_data.get('frames', [])
+    if not frames:
+        print('[Warning] ffprobe returned no frame entries — cannot detect keyframes')
+        return set(), {}
+
+    # Determine time-range boundaries (in seconds)
+    start_sec = time_to_seconds(start_time) if start_time else None
+    end_sec = time_to_seconds(end_time) if end_time else None
+
+    keyframe_indices = set()
+    keyframe_info = {}
+
+    for i, frame in enumerate(frames, start=1):
+        pict_type = frame.get('pict_type', '')
+        pts_time_str = frame.get('pts_time', '')
+
+        if pict_type != 'I':
+            continue
+
+        # Parse pts_time — skip frames with invalid/missing timestamps
+        try:
+            pts_time = float(pts_time_str)
+        except (ValueError, TypeError):
+            continue
+
+        # Filter by time range
+        if start_sec is not None and pts_time < start_sec:
+            continue
+        if end_sec is not None and pts_time > end_sec:
+            continue
+
+        keyframe_indices.add(i)
+        keyframe_info[i] = pts_time
+
+    if not keyframe_indices:
+        print('[Warning] No keyframes (I-frames) detected in the video')
+        if start_sec is not None or end_sec is not None:
+            print(f'  Time range: {start_time or "start"} ~ {end_time or "end"}')
+    else:
+        print(f'[Step 1.5] ffprobe detected {len(keyframe_indices)} keyframes in video')
+
+    return keyframe_indices, keyframe_info
 
 
-def _build_ffprobe_interval(start_time: str = None, end_time: str = None) -> str:
-    """Build ffprobe -read_intervals value like '%+00:01:00' or '%00:00:10%00:00:30'."""
-    # Handle None values properly
-    start = start_time if start_time is not None else ''
-    end = end_time if end_time is not None else ''
-
-    # When start is empty or the beginning of the video, use %+duration format
-    if not start or start == '00:00:00':
-        if end:
-            return f'%+{end}'
-        return '%+99999'  # effectively read all
-
-    if end:
-        return f'%{start}%{end}'
-
-    return f'%{start}%+99999'
-
-
-def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set):
+def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set,
+                      keyframe_info: dict = None, video_path: str = None,
+                      start_time: str = None, end_time: str = None, fps: float = None):
     """
     Create keyframes_original/ with symlinks to original keyframes.
     Returns (keyframes_original_dir, list_of_keyframe_names).
+
+    Frame-index alignment
+    ---------------------
+    ``keyframe_indices`` are 1-based indices into the *source video* (as
+    reported by ffprobe).  However, when ``start_time`` is specified the
+    extracted frames in ``frames_dir`` start from ``frame_00000001.png``,
+    which corresponds to the first frame *within the time range*, not the
+    first frame of the video.  We must therefore convert video-frame indices
+    to extracted-frame indices.
+
+    Two strategies are attempted (in order):
+
+    1. **Timestamp matching** (preferred): if ``keyframe_info`` (a mapping
+       of index → pts_time) and ``fps`` are available, compute the expected
+       pts_time for each extracted frame and match against keyframe
+       timestamps.
+    2. **Offset subtraction** (fallback): if the start offset in frames can
+       be computed from ``start_time`` and ``fps``, simply subtract it from
+       each keyframe index.
     """
     keyframes_orig_dir = os.path.join(work_dir, 'keyframes_original')
     os.makedirs(keyframes_orig_dir, exist_ok=True)
 
     all_frames = sorted(glob(os.path.join(frames_dir, 'frame_*.png')))
-    keyframe_names = []
+    total_extracted = len(all_frames)
 
+    if total_extracted == 0:
+        print('[Step 1.5] No frames found in frames_dir — skipping keyframe collection')
+        return keyframes_orig_dir, []
+
+    # Determine the frame offset (1-based video frame index of the first
+    # extracted frame).
+    start_sec = time_to_seconds(start_time) if start_time else 0.0
+
+    # Strategy 1: timestamp matching using keyframe_info
+    aligned_indices = set()
+    if keyframe_info and fps and fps > 0:
+        # Build a mapping: extracted-frame 1-based index → pts_time
+        # The first extracted frame corresponds to start_sec.
+        for idx in keyframe_indices:
+            kf_pts = keyframe_info.get(idx)
+            if kf_pts is None:
+                continue
+            # Compute which extracted frame this corresponds to
+            # extracted frame 1 is at start_sec, frame 2 is at start_sec + 1/fps, etc.
+            frame_offset = (kf_pts - start_sec) * fps
+            extracted_idx = round(frame_offset) + 1  # 1-based
+            if 1 <= extracted_idx <= total_extracted:
+                aligned_indices.add(extracted_idx)
+        if aligned_indices:
+            print(f'[Step 1.5] Timestamp-matched {len(aligned_indices)} keyframes from {len(keyframe_indices)} video keyframes')
+
+    # Strategy 2: offset subtraction fallback
+    if not aligned_indices and start_sec > 0 and fps and fps > 0:
+        offset_frames = round(start_sec * fps)
+        for idx in keyframe_indices:
+            extracted_idx = idx - offset_frames
+            if 1 <= extracted_idx <= total_extracted:
+                aligned_indices.add(extracted_idx)
+        if aligned_indices:
+            print(f'[Step 1.5] Offset-aligned {len(aligned_indices)} keyframes')
+
+    # No offset needed (start from beginning) or no keyframe_info
+    if not aligned_indices:
+        # Direct index mapping (works when start_time is None / 0)
+        aligned_indices = {idx for idx in keyframe_indices if 1 <= idx <= total_extracted}
+
+    # Create symlinks
+    keyframe_names = []
     for i, frame_path in enumerate(all_frames, start=1):
-        if i in keyframe_indices:
+        if i in aligned_indices:
             name = os.path.basename(frame_path)
             link_path = os.path.join(keyframes_orig_dir, name)
             if not os.path.exists(link_path):
                 os.symlink(os.path.abspath(frame_path), link_path)
             keyframe_names.append(name)
 
-    print(f'[Step 1.5] Detected {len(keyframe_names)} keyframes out of {len(all_frames)} total frames '
-          f'({100 * len(keyframe_names) / max(len(all_frames), 1):.1f}%)')
+    pct = 100 * len(keyframe_names) / max(total_extracted, 1)
+    print(f'[Step 1.5] Collected {len(keyframe_names)} keyframes out of {total_extracted} total frames ({pct:.1f}%)')
     print(f'  Original keyframes → {keyframes_orig_dir}')
 
     return keyframes_orig_dir, keyframe_names
@@ -321,17 +506,24 @@ def collect_swapped_keyframes(segments: list, work_dir: str, keyframe_names: lis
 
     keyframe_set = set(keyframe_names)
     found = 0
+    missing = []
 
     for seg in segments:
         for name in seg['frame_names']:
             if name in keyframe_set:
                 output_frame = os.path.join(seg['output_dir'], name)
                 link_path = os.path.join(keyframes_swap_dir, name)
-                if os.path.exists(output_frame) and not os.path.exists(link_path):
-                    os.symlink(os.path.abspath(output_frame), link_path)
+                if os.path.exists(output_frame):
+                    if not os.path.exists(link_path):
+                        os.symlink(os.path.abspath(output_frame), link_path)
                     found += 1
+                else:
+                    missing.append(name)
 
     print(f'[Step 4.5] Collected {found}/{len(keyframe_names)} swapped keyframes → {keyframes_swap_dir}')
+    if missing:
+        print(f'  [Warning] {len(missing)} keyframes were not processed by face-swap: '
+              f'{missing[:5]}{"..." if len(missing) > 5 else ""}')
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +631,178 @@ def _write_facefusion_job_json(jobs_path: str, job_id: str, steps: list):
     job_json_path = os.path.join(queued_dir, f'{job_id}.json')
     with open(job_json_path, 'w') as jf:
         json.dump(job_data, jf, indent=2)
+
+
+def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
+                      facefusion_script: str, work_dir: str,
+                      batch_size: int = 300, face_swap_debug: bool = False) -> str:
+    """
+    Run FaceFusion on keyframes only (turbo mode).
+
+    This is a streamlined version of ``launch_workers`` that processes a
+    single directory of keyframe images without splitting into segments.
+    The output goes directly to ``keyframes_swapped/``.
+
+    Parameters
+    ----------
+    keyframes_dir : str
+        Directory containing keyframe images (from turbo-mode extraction).
+    source_paths : list[str]
+        Source face image path(s).
+    config_path : str
+        Path to facefusion.ini.
+    facefusion_script : str
+        Path to facefusion.py.
+    work_dir : str
+        Working directory.
+    batch_size : int
+        Frames per mini-batch (default 300).
+    face_swap_debug : bool
+        Enable debug output.
+
+    Returns
+    -------
+    str
+        Path to ``keyframes_swapped/`` directory.
+    """
+    keyframes_swapped_dir = os.path.join(work_dir, 'keyframes_swapped')
+    os.makedirs(keyframes_swapped_dir, exist_ok=True)
+
+    all_keyframes = sorted(glob(os.path.join(keyframes_dir, 'frame_*.png')))
+    if not all_keyframes:
+        print('[Error] No keyframe images found in ' + keyframes_dir)
+        return keyframes_swapped_dir
+
+    source_abs_list = [os.path.abspath(p) for p in source_paths]
+    config_abs = os.path.abspath(config_path)
+    facefusion_dir = os.path.dirname(os.path.abspath(facefusion_script))
+    python_exe = sys.executable
+    output_dir_abs = os.path.abspath(keyframes_swapped_dir)
+    keyframes_dir_abs = os.path.abspath(keyframes_dir)
+
+    # Read step-level config defaults
+    config_step_defaults = _read_config_step_args(config_path)
+
+    # Split keyframes into mini-batches
+    frame_names = [os.path.basename(f) for f in all_keyframes]
+    mini_batches = [frame_names[i:i + batch_size] for i in range(0, len(frame_names), batch_size)]
+
+    # Build worker shell script
+    script_path = os.path.join(work_dir, 'run_keyframe_worker.sh')
+    with open(script_path, 'w') as f:
+        f.write('#!/bin/bash\n')
+        f.write(f'cd "{facefusion_dir}"\n\n')
+        for mb_idx, mb_frames in enumerate(mini_batches):
+            jobs_path = os.path.join(work_dir, f'jobs_keyframes_{mb_idx}')
+            mb_job_id = f'keyframes-mb-{mb_idx}'
+
+            # Build steps — each keyframe is one step
+            steps = []
+            for frame_name in mb_frames:
+                frame_path = os.path.join(keyframes_dir_abs, frame_name)
+                output_frame = os.path.join(output_dir_abs, frame_name)
+                step_args = {
+                    'source_paths': source_abs_list,
+                    'target_path': frame_path,
+                    'output_path': output_frame,
+                    'processors': ['face_swapper'],
+                }
+                step_args.update(config_step_defaults)
+                step = {
+                    'args': step_args,
+                    'status': 'queued',
+                }
+                if face_swap_debug:
+                    step['args']['face_swap_debug'] = True
+                steps.append(step)
+
+            _write_facefusion_job_json(jobs_path, mb_job_id, steps)
+
+            f.write(
+                f'echo "[Keyframe Worker] mini-batch {mb_idx + 1}/{len(mini_batches)}'
+                f' ({len(mb_frames)} keyframes)"\n'
+            )
+            f.write(
+                f'"{python_exe}" "{facefusion_script}" job-run'
+                f' {mb_job_id}'
+                f' --config-path "{config_abs}"'
+                f' --jobs-path "{jobs_path}"'
+                '\n\n'
+            )
+    os.chmod(script_path, 0o755)
+
+    # Run the worker script (single process — keyframes are few)
+    print(f'[Step 2] [Turbo Mode] Processing {len(all_keyframes)} keyframes '
+          f'in {len(mini_batches)} mini-batches ...')
+    print(f'  Script:         {script_path}')
+    print(f'  Source:         {", ".join(source_abs_list)}')
+    print(f'  Input dir:      {keyframes_dir_abs}')
+    print(f'  Output dir:     {output_dir_abs}')
+
+    log_path = os.path.join(work_dir, 'keyframe_worker.log')
+
+    env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
+
+    log_file = open(log_path, 'w')
+    proc = subprocess.Popen(
+        ['bash', script_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        cwd=facefusion_dir,
+        env=env,
+    )
+
+    # Monitor progress
+    try:
+        from tqdm import tqdm
+        bar = tqdm(
+            total=len(all_keyframes),
+            desc='Keyframes',
+            leave=True,
+            ncols=100,
+            colour='green',
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+        )
+        prev_count = 0
+        while proc.poll() is None:
+            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+            delta = count - prev_count
+            if delta > 0:
+                bar.update(delta)
+                prev_count = count
+            time.sleep(1.0)
+        # Final count
+        count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+        delta = count - prev_count
+        if delta > 0:
+            bar.update(delta)
+        bar.close()
+        print()
+    except ImportError:
+        while proc.poll() is None:
+            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+            print(f'\r[Progress] Keyframes: {count}/{len(all_keyframes)}', end='', flush=True)
+            time.sleep(2.0)
+        print()
+
+    # Check return code
+    proc.wait()
+    log_file.close()
+    if proc.returncode != 0:
+        print(f'[Warning] Keyframe worker exited with code {proc.returncode}. Check {log_path}')
+        if os.path.exists(log_path):
+            with open(log_path, 'r') as f:
+                lines = f.readlines()
+                print('--- Last 20 lines of keyframe_worker.log ---')
+                for line in lines[-20:]:
+                    print(f'  {line}', end='')
+                print('---')
+
+    processed = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+    print(f'[Step 2] [Turbo Mode] Processed {processed}/{len(all_keyframes)} keyframes')
+
+    return keyframes_swapped_dir
 
 
 def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False) -> list:
@@ -718,6 +1082,76 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
 
 
 # ---------------------------------------------------------------------------
+# Turbo Mode Report
+# ---------------------------------------------------------------------------
+
+def _print_turbo_report(work_dir: str, keyframe_count: int, total_frame_count: int,
+                        processed_keyframes: int, elapsed: float, args):
+    """
+    Print a summary report after turbo mode completes.
+    Includes statistics, output paths, and a copy-paste command for full processing.
+    """
+    keyframes_original_dir = os.path.join(work_dir, 'keyframes_original')
+    keyframes_swapped_dir = os.path.join(work_dir, 'keyframes_swapped')
+
+    pct = 100 * keyframe_count / max(total_frame_count, 1)
+    processed_pct = 100 * processed_keyframes / max(keyframe_count, 1)
+
+    print()
+    print('=' * 70)
+    print('  TURBO MODE — Preview Complete')
+    print('=' * 70)
+    print(f'  Total time:           {elapsed:.1f}s ({elapsed/60:.1f} min)')
+    print(f'  Total frames:         {total_frame_count}')
+    print(f'  Keyframes (I-frames): {keyframe_count} ({pct:.1f}%)')
+    print(f'  Processed keyframes:  {processed_keyframes}/{keyframe_count} ({processed_pct:.1f}%)')
+    print()
+    print('  Output directories:')
+    print(f'    Original keyframes: {keyframes_original_dir}')
+    print(f'    Swapped keyframes:  {keyframes_swapped_dir}')
+    print()
+    print('  To preview results, compare the directories above.')
+    print('  To run FULL face-swap on all frames, use this command:')
+    print()
+
+    # Build the equivalent full-frame command (without --turbo-mode)
+    cmd_parts = [
+        sys.executable,
+        os.path.abspath(__file__),
+        '--video', args.video,
+        '--source', *args.source,
+        '--workers', str(args.workers),
+        '--config-path', args.config_path,
+        '--batch-size', str(args.batch_size),
+    ]
+    if args.start_time:
+        cmd_parts += ['--start-time', args.start_time]
+    if args.end_time:
+        cmd_parts += ['--end-time', args.end_time]
+    if args.work_base != '.':
+        cmd_parts += ['--work-base', args.work_base]
+    if args.output:
+        cmd_parts += ['--output', args.output]
+    if args.face_swap_debug:
+        cmd_parts += ['--face-swap-debug']
+
+    # Format the command nicely with line continuations
+    cmd_str = ''
+    for i, part in enumerate(cmd_parts):
+        if i == 0:
+            cmd_str = part
+        elif part.startswith('-'):
+            cmd_str += ' \\\n    ' + part
+        else:
+            cmd_str += ' ' + part
+
+    print(f'    {cmd_str}')
+    print()
+    print(f'  Work directory: {work_dir} (preserved)')
+    print('=' * 70)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -801,18 +1235,62 @@ Examples:
 
     print('=' * 70)
     print('  Video Face-Swap Pipeline')
+    if args.turbo_mode:
+        print('  ** TURBO MODE — keyframes only, no video output **')
     print('=' * 70)
     print(f'  Video:        {args.video}')
     print(f'  Source face:  {", ".join(args.source)}')
-    print(f'  Output:       {output_path}')
+    print(f'  Output:       {output_path if not args.turbo_mode else "(not created in turbo mode)"}')
     print(f'  Workers:      {args.workers}')
     print(f'  Batch size:   {args.batch_size}')
     print(f'  Time range:   {args.start_time or "start"} ~ {args.end_time or "end"}')
     print(f'  Work dir:     {work_dir}')
     print(f'  Config:       {args.config_path}')
+    print(f'  Turbo mode:   {args.turbo_mode}')
     print('=' * 70)
 
     start_total = time.time()
+
+    # ======================================================================
+    # TURBO MODE
+    # ======================================================================
+    if args.turbo_mode:
+        # Step 1 (turbo): Extract only keyframes
+        result = extract_frames(
+            args.video, work_dir, args.start_time, args.end_time,
+            turbo_mode=True,
+        )
+        keyframes_dir, _, fps, keyframe_count, total_frame_count = result
+
+        # If no keyframes were extracted, exit gracefully
+        if keyframe_count == 0:
+            print('[Info] Turbo mode finished with no keyframes to process.')
+            return
+
+        # Step 2 (turbo): Process keyframes with FaceFusion
+        keyframes_swapped_dir = process_keyframes(
+            keyframes_dir, args.source, args.config_path,
+            facefusion_script, work_dir, args.batch_size,
+            face_swap_debug=args.face_swap_debug,
+        )
+
+        processed_keyframes = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+
+        # Print turbo mode summary report
+        elapsed = time.time() - start_total
+        _print_turbo_report(
+            work_dir=work_dir,
+            keyframe_count=keyframe_count,
+            total_frame_count=total_frame_count,
+            processed_keyframes=processed_keyframes,
+            elapsed=elapsed,
+            args=args,
+        )
+        return  # turbo mode done — no video reassembly
+
+    # ======================================================================
+    # NORMAL (FULL-FRAME) MODE
+    # ======================================================================
 
     # Step 1: Extract frames
     frames_dir, audio_path, fps = extract_frames(
@@ -820,8 +1298,15 @@ Examples:
     )
 
     # Step 1.5: Detect keyframes and collect originals
-    keyframe_indices = detect_keyframe_indices(args.video, args.start_time, args.end_time)
-    _, keyframe_names = collect_keyframes(frames_dir, work_dir, keyframe_indices)
+    keyframe_indices, keyframe_info = detect_keyframe_indices(args.video, args.start_time, args.end_time)
+    _, keyframe_names = collect_keyframes(
+        frames_dir, work_dir, keyframe_indices,
+        keyframe_info=keyframe_info,
+        video_path=args.video,
+        start_time=args.start_time,
+        end_time=args.end_time,
+        fps=fps,
+    )
 
     # Step 2: Split into segments
     segments = split_frames_into_segments(frames_dir, work_dir, args.workers)
