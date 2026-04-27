@@ -5,18 +5,25 @@ Video Face-Swap Pipeline Script
 Workaround for FaceFusion not detecting faces in certain video encodings:
 1. Extract video frames as images
 2. Split frames into time-segment batches
-3. Run multiple FaceFusion batch-run processes in parallel
+3. Run multiple FaceFusion job-run processes in parallel
 4. Reassemble processed frames into video with original audio
 
 Usage:
-    python video_face_swap.py \
-        --video input.mp4 \
-        --source face.jpg \
-        --output result.mp4 \
-        --workers 3 \
-        --start-time 00:00:10 \
-        --end-time 00:00:30 \
+    python video_face_swap.py \\
+        --video input.mp4 \\
+        --source face.jpg \\
+        --output result.mp4 \\
+        --workers 3 \\
+        --start-time 00:00:10 \\
+        --end-time 00:00:30 \\
         --config-path facefusion.ini
+
+    # Multiple source images (averaged to create a composite reference face)
+    python video_face_swap.py \\
+        --video input.mp4 \\
+        --source face1.jpg face2.jpg face3.jpg \\
+        --output result.mp4 \\
+        --workers 4
 """
 
 import argparse
@@ -25,6 +32,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 from glob import glob
 
 
@@ -329,19 +337,60 @@ def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -
 # Step 3 & 4: Launch workers with progress monitoring
 # ---------------------------------------------------------------------------
 
-def launch_workers(segments: list, source_path: str, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False) -> list:
+def _write_facefusion_job_json(jobs_path: str, job_id: str, steps: list):
+    """
+    Write a FaceFusion job JSON file directly into the queued directory.
+
+    This bypasses the slow ``job-create`` -> ``job-add-step`` x N -> ``job-submit``
+    CLI pipeline.  Each step carries the full ``source_paths`` list so that
+    ``extract_source_face`` can average multiple reference faces.
+
+    The step format is identical to what ``headless-run`` produces internally
+    (see ``core.process_headless``): each step has ``source_paths`` (list of
+    source image paths), ``target_path`` (single target), and ``output_path``.
+    The difference is that we batch many steps into one job and run them with
+    a single ``job-run`` invocation, so the model is loaded only once.
+
+    Parameters
+    ----------
+    jobs_path : str
+        Root of the FaceFusion jobs directory (passed via ``--jobs-path``).
+    job_id : str
+        Unique job identifier (used as the JSON filename stem).
+    steps : list[dict]
+        Each element is ``{'args': {...}, 'status': 'queued'}``.
+    """
+    queued_dir = os.path.join(jobs_path, 'queued')
+    os.makedirs(queued_dir, exist_ok=True)
+
+    job_data = {
+        'version': '1',
+        'date_created': datetime.now().isoformat(),
+        'date_updated': None,
+        'steps': steps,
+    }
+    job_json_path = os.path.join(queued_dir, f'{job_id}.json')
+    with open(job_json_path, 'w') as jf:
+        json.dump(job_data, jf, indent=2)
+
+
+def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False) -> list:
     """
     Launch FaceFusion worker subprocesses.
 
-    Each worker's frames are further split into mini-batches (default 50 frames).
-    Each mini-batch is one batch-run invocation with --processors face_swapper.
-    The model loads once per mini-batch and processes all frames, then the next
-    batch-run starts. This balances:
-    - Avoiding the O(n^2) JSON bottleneck of huge batch-run jobs
-    - Avoiding per-frame process startup overhead of headless-run
+    Multiple source images are supported — they are passed as ``source_paths``
+    to every step so that ``extract_source_face`` computes an average face
+    embedding across all source images (same behaviour as ``headless-run -s
+    img1 -s img2 ...``).
+
+    Each worker's frames are further split into mini-batches (default 300
+    frames).  For each mini-batch a FaceFusion job JSON is written *directly*
+    into the queued directory (bypassing the slow per-step CLI calls).  A
+    single ``job-run`` invocation then processes all frames — the model loads
+    only once per mini-batch.
     """
     processes = []
-    source_abs = os.path.abspath(source_path)
+    source_abs_list = [os.path.abspath(p) for p in source_paths]
     config_abs = os.path.abspath(config_path)
     facefusion_dir = os.path.dirname(os.path.abspath(facefusion_script))
     python_exe = sys.executable
@@ -354,42 +403,47 @@ def launch_workers(segments: list, source_path: str, config_path: str, facefusio
         frame_names = seg['frame_names']
         mini_batches = [frame_names[i:i + batch_size] for i in range(0, len(frame_names), batch_size)]
 
-        # Create a sub-directory per mini-batch with symlinks, so batch-run can glob it
-        mini_batch_dirs = []
-        for mb_idx, mb_frames in enumerate(mini_batches):
-            mb_dir = os.path.join(work_dir, f'mini_{seg["worker_id"]}_{mb_idx}')
-            os.makedirs(mb_dir, exist_ok=True)
-            for name in mb_frames:
-                link_path = os.path.join(mb_dir, name)
-                if not os.path.exists(link_path):
-                    os.symlink(os.path.join(batch_dir_abs, name), link_path)
-            mini_batch_dirs.append(mb_dir)
-
-        # Generate a shell script: one batch-run per mini-batch
+        # Build job JSON files & worker shell script
         script_path = os.path.join(work_dir, f'run_worker_{seg["worker_id"]}.sh')
         with open(script_path, 'w') as f:
             f.write('#!/bin/bash\n')
             f.write(f'cd "{facefusion_dir}"\n\n')
-            for mb_idx, mb_dir in enumerate(mini_batch_dirs):
-                mb_dir_abs = os.path.abspath(mb_dir)
+            for mb_idx, mb_frames in enumerate(mini_batches):
                 jobs_path = os.path.join(work_dir, f'jobs_{seg["worker_id"]}_{mb_idx}')
-                os.makedirs(jobs_path, exist_ok=True)
-                target_pattern = os.path.join(mb_dir_abs, '*.png')
-                output_pattern = os.path.join(output_dir_abs, '{target_name}{target_extension}')
+                mb_job_id = f'worker_{seg["worker_id"]}_mb_{mb_idx}'
+
+                # Build steps — each frame is one step, all steps share the same source_paths
+                steps = []
+                for frame_name in mb_frames:
+                    frame_path = os.path.join(batch_dir_abs, frame_name)
+                    output_frame = os.path.join(output_dir_abs, frame_name)
+                    step = {
+                        'args': {
+                            'source_paths': source_abs_list,
+                            'target_path': frame_path,
+                            'output_path': output_frame,
+                            'processors': ['face_swapper'],
+                        },
+                        'status': 'queued',
+                    }
+                    if face_swap_debug:
+                        step['args']['face_swap_debug'] = True
+                    steps.append(step)
+
+                # Write the job JSON directly into the queued directory
+                _write_facefusion_job_json(jobs_path, mb_job_id, steps)
+
+                # Shell command: just run the job
                 f.write(
                     f'echo "[Worker {seg["worker_id"]}] mini-batch {mb_idx + 1}/{len(mini_batches)}'
-                    f' ({len(mini_batches[mb_idx])} frames)"\n'
+                    f' ({len(mb_frames)} frames)"\n'
                 )
                 f.write(
-                    f'"{python_exe}" "{facefusion_script}" batch-run'
-                    f' --processors face_swapper'
+                    f'"{python_exe}" "{facefusion_script}" job-run'
+                    f' --job-id {mb_job_id}'
                     f' --config-path "{config_abs}"'
                     f' --jobs-path "{jobs_path}"'
-                    f' -s "{source_abs}"'
-                    f' -t "{target_pattern}"'
-                    f' -o "{output_pattern}"'
-                    + (' --face-swap-debug' if face_swap_debug else '')
-                    + '\n\n'
+                    '\n\n'
                 )
         os.chmod(script_path, 0o755)
 
@@ -400,7 +454,7 @@ def launch_workers(segments: list, source_path: str, config_path: str, facefusio
         print(f'[Step 3] Launching worker {seg["worker_id"]}: {seg["frame_count"]} frames '
               f'in {len(mini_batches)} mini-batches of ~{batch_size}')
         print(f'  Script:        {script_path}')
-        print(f'  Source:        {source_abs} (exists: {os.path.isfile(source_abs)})')
+        print(f'  Source:        {", ".join(source_abs_list)} (exists: {all(os.path.isfile(s) for s in source_abs_list)})')
         print(f'  Config:        {config_abs} (exists: {os.path.isfile(config_abs)})')
         print(f'  Output dir:    {output_dir_abs}')
         print(f'  Log:           {log_path}')
@@ -599,6 +653,9 @@ Examples:
   # Basic usage — work dir auto-named as ./input_face/
   python video_face_swap.py --video input.mp4 --source face.jpg --workers 3
 
+  # Multiple source images (averaged to create a composite reference face)
+  python video_face_swap.py --video input.mp4 --source face1.jpg face2.jpg face3.jpg --workers 4
+
   # Process only a specific time range
   python video_face_swap.py --video input.mp4 --source face.jpg \\
       --workers 4 --start-time 00:01:00 --end-time 00:02:30
@@ -614,7 +671,7 @@ Examples:
     )
 
     parser.add_argument('--video', required=True, help='Input video file path')
-    parser.add_argument('--source', required=True, help='Source face image path')
+    parser.add_argument('--source', required=True, nargs='+', help='Source face image path(s). Multiple images will be averaged to create a composite reference face.')
     parser.add_argument('--output', default=None, help='Output video file path (default: inside work dir)')
     parser.add_argument('--workers', type=int, default=2, help='Number of parallel FaceFusion processes (default: 2)')
     parser.add_argument('--start-time', default=None, help='Start time (HH:MM:SS or seconds)')
@@ -631,9 +688,10 @@ Examples:
     if not os.path.isfile(args.video):
         print(f'[Error] Video file not found: {args.video}')
         sys.exit(1)
-    if not os.path.isfile(args.source):
-        print(f'[Error] Source face image not found: {args.source}')
-        sys.exit(1)
+    for src in args.source:
+        if not os.path.isfile(src):
+            print(f'[Error] Source face image not found: {src}')
+            sys.exit(1)
     if not os.path.isfile(args.config_path):
         print(f'[Error] Config file not found: {args.config_path}')
         sys.exit(1)
@@ -649,9 +707,10 @@ Examples:
         print('[Error] --workers must be >= 1')
         sys.exit(1)
 
-    # Build work dir name: {video_stem}_{source_stem}
+    # Build work dir name: {video_stem}_{source_stems_joined}
     video_stem = os.path.splitext(os.path.basename(args.video))[0]
-    source_stem = os.path.splitext(os.path.basename(args.source))[0]
+    source_stems = [os.path.splitext(os.path.basename(s))[0] for s in args.source]
+    source_stem = '_'.join(source_stems) if len(source_stems) <= 3 else source_stems[0] + f'_+{len(source_stems)-1}more'
     work_dir_name = f'{video_stem}_{source_stem}'
     work_dir = os.path.abspath(os.path.join(args.work_base, work_dir_name))
     os.makedirs(work_dir, exist_ok=True)
@@ -666,14 +725,14 @@ Examples:
     print('=' * 70)
     print('  Video Face-Swap Pipeline')
     print('=' * 70)
-    print(f'  Video:       {args.video}')
-    print(f'  Source face: {args.source}')
-    print(f'  Output:      {output_path}')
-    print(f'  Workers:     {args.workers}')
-    print(f'  Batch size:  {args.batch_size}')
-    print(f'  Time range:  {args.start_time or "start"} ~ {args.end_time or "end"}')
-    print(f'  Work dir:    {work_dir}')
-    print(f'  Config:      {args.config_path}')
+    print(f'  Video:        {args.video}')
+    print(f'  Source face:  {", ".join(args.source)}')
+    print(f'  Output:       {output_path}')
+    print(f'  Workers:      {args.workers}')
+    print(f'  Batch size:   {args.batch_size}')
+    print(f'  Time range:   {args.start_time or "start"} ~ {args.end_time or "end"}')
+    print(f'  Work dir:     {work_dir}')
+    print(f'  Config:       {args.config_path}')
     print('=' * 70)
 
     start_total = time.time()
