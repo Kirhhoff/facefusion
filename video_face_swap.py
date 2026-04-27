@@ -1333,13 +1333,72 @@ Examples:
             print('[Info] Turbo mode finished with no keyframes to process.')
             return
 
-        # Step 2 (turbo): Process keyframes with FaceFusion
-        keyframes_swapped_dir = process_keyframes(
-            keyframes_dir, args.source, args.config_path,
+        # Step 2 (turbo): Split keyframes into segments for parallel processing
+        #    Reuse the same split logic as normal mode — all frames in
+        #    keyframes_original/ are keyframes, so each worker gets a
+        #    contiguous chunk.
+        segments = split_frames_into_segments(keyframes_dir, work_dir, args.workers)
+
+        # Step 3 (turbo): Launch parallel workers
+        processes = launch_workers(
+            segments, args.source, args.config_path,
             facefusion_script, work_dir, args.batch_size,
             face_swap_debug=args.face_swap_debug,
         )
 
+        # Step 4 (turbo): Monitor progress
+        print(f'[Step 4] [Turbo Mode] Monitoring {len(processes)} workers ...')
+
+        # Give workers a moment to start, then check if any died immediately
+        time.sleep(3)
+        for proc in processes:
+            ret = proc.poll()
+            if ret is not None and ret != 0:
+                proc._log_file.flush()
+                log_path = os.path.join(work_dir, f'worker_{proc._worker_id}.log')
+                print(f'\n[ERROR] Worker {proc._worker_id} exited immediately with code {ret}!')
+                print(f'--- worker_{proc._worker_id}.log ---')
+                try:
+                    with open(log_path, 'r') as f:
+                        content = f.read()
+                        if content.strip():
+                            print(content)
+                        else:
+                            print('  (log is empty)')
+                except Exception:
+                    print('  (could not read log)')
+                print('---')
+
+        monitor_progress(segments, processes)
+
+        # Close log files and check return codes
+        failed_workers = []
+        for proc in processes:
+            proc.wait()
+            if hasattr(proc, '_log_file'):
+                proc._log_file.close()
+            if proc.returncode != 0:
+                failed_workers.append(proc._worker_id)
+
+        if failed_workers:
+            print(f'[Warning] Workers {failed_workers} exited with errors. Check logs in {work_dir}/')
+            for wid in failed_workers:
+                log_path = os.path.join(work_dir, f'worker_{wid}.log')
+                if os.path.exists(log_path):
+                    print(f'\n--- Last 20 lines of worker_{wid}.log ---')
+                    with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                        for line in lines[-20:]:
+                            print(f'  {line}', end='')
+                    print()
+
+        # Collect swapped keyframes from all worker output dirs into keyframes_swapped/
+        all_keyframe_names = []
+        for seg in segments:
+            all_keyframe_names.extend(seg['frame_names'])
+        collect_swapped_keyframes(segments, work_dir, all_keyframe_names)
+
+        keyframes_swapped_dir = os.path.join(work_dir, 'keyframes_swapped')
         processed_keyframes = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
 
         # Print turbo mode summary report
