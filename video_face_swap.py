@@ -410,7 +410,7 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
             f.write(f'cd "{facefusion_dir}"\n\n')
             for mb_idx, mb_frames in enumerate(mini_batches):
                 jobs_path = os.path.join(work_dir, f'jobs_{seg["worker_id"]}_{mb_idx}')
-                mb_job_id = f'worker_{seg["worker_id"]}_mb_{mb_idx}'
+                mb_job_id = f'worker-{seg["worker_id"]}-mb-{mb_idx}'
 
                 # Build steps — each frame is one step, all steps share the same source_paths
                 steps = []
@@ -440,7 +440,7 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 )
                 f.write(
                     f'"{python_exe}" "{facefusion_script}" job-run'
-                    f' --job-id {mb_job_id}'
+                    f' {mb_job_id}'
                     f' --config-path "{config_abs}"'
                     f' --jobs-path "{jobs_path}"'
                     '\n\n'
