@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import time
+from configparser import ConfigParser
 from datetime import datetime
 from glob import glob
 
@@ -95,6 +96,152 @@ def seconds_to_timecode(seconds: float) -> str:
     m = int((seconds % 3600) // 60)
     s = seconds % 60
     return f'{h:02d}:{m:02d}:{s:06.3f}'
+
+
+def _read_config_step_args(config_path: str) -> dict:
+    """
+    Read step-level args from facefusion.ini so that they are present in the
+    job JSON.  Without this, FaceFusion's ``apply_args(step_args, state_manager.set_item)``
+    would call ``args.get('face_swapper_model')`` → ``None`` and **overwrite** the
+    default value that was set by ``init_item`` during CLI parsing.
+
+    We only need to include keys whose *absence* would cause a crash or
+    unwanted behaviour.  The values come from the same config file that the
+    worker process will read via ``--config-path``, so they are guaranteed
+    to be consistent.
+
+    Parameters
+    ----------
+    config_path : str
+        Path to ``facefusion.ini``.
+
+    Returns
+    -------
+    dict
+        Step args dict with config-derived values.
+    """
+    cp = ConfigParser()
+    cp.read(config_path, encoding='utf-8')
+
+    step_args: dict = {}
+
+    # --- Processors section ---
+    proc_section = 'processors'
+    # Numeric keys that need type conversion (argparse would normally do this)
+    proc_numeric_keys = {
+        'face_swapper_weight': float,
+    }
+    processor_keys = [
+        'face_swapper_model',
+        'face_swapper_pixel_boost',
+        'face_swapper_weight',
+    ]
+    for key in processor_keys:
+        if cp.has_option(proc_section, key) and cp.get(proc_section, key).strip():
+            val = cp.get(proc_section, key).strip()
+            if key in proc_numeric_keys:
+                try:
+                    step_args[key] = proc_numeric_keys[key](val)
+                except (ValueError, TypeError):
+                    step_args[key] = val
+            else:
+                step_args[key] = val
+
+    # --- Face detector section ---
+    det_section = 'face_detector'
+    det_numeric_keys = {
+        'face_detector_score': float,
+    }
+    det_keys = [
+        'face_detector_model',
+        'face_detector_size',
+        'face_detector_margin',
+        'face_detector_angles',
+        'face_detector_score',
+    ]
+    for key in det_keys:
+        if cp.has_option(det_section, key) and cp.get(det_section, key).strip():
+            val = cp.get(det_section, key).strip()
+            if key in det_numeric_keys:
+                try:
+                    step_args[key] = det_numeric_keys[key](val)
+                except (ValueError, TypeError):
+                    step_args[key] = val
+            elif ' ' in val:
+                # Convert space-separated lists to actual lists (e.g. "0 90 180 270")
+                step_args[key] = val.split()
+            else:
+                step_args[key] = val
+
+    # --- Face landmarker section ---
+    land_section = 'face_landmarker'
+    land_numeric_keys = {
+        'face_landmarker_score': float,
+    }
+    land_keys = [
+        'face_landmarker_model',
+        'face_landmarker_score',
+    ]
+    for key in land_keys:
+        if cp.has_option(land_section, key) and cp.get(land_section, key).strip():
+            val = cp.get(land_section, key).strip()
+            if key in land_numeric_keys:
+                try:
+                    step_args[key] = land_numeric_keys[key](val)
+                except (ValueError, TypeError):
+                    step_args[key] = val
+            else:
+                step_args[key] = val
+
+    # --- Face selector section ---
+    sel_section = 'face_selector'
+    sel_numeric_keys = {
+        'reference_face_distance': float,
+    }
+    sel_keys = [
+        'face_selector_mode',
+        'face_selector_order',
+        'face_selector_gender',
+        'face_selector_race',
+        'reference_face_distance',
+    ]
+    for key in sel_keys:
+        if cp.has_option(sel_section, key) and cp.get(sel_section, key).strip():
+            val = cp.get(sel_section, key).strip()
+            if key in sel_numeric_keys:
+                try:
+                    step_args[key] = sel_numeric_keys[key](val)
+                except (ValueError, TypeError):
+                    step_args[key] = val
+            else:
+                step_args[key] = val
+
+    # --- Face masker section ---
+    mask_section = 'face_masker'
+    mask_numeric_keys = {
+        'face_mask_blur': float,
+    }
+    mask_keys = [
+        'face_occluder_model',
+        'face_parser_model',
+        'face_mask_types',
+        'face_mask_blur',
+        'face_mask_padding',
+    ]
+    for key in mask_keys:
+        if cp.has_option(mask_section, key) and cp.get(mask_section, key).strip():
+            val = cp.get(mask_section, key).strip()
+            if key in mask_numeric_keys:
+                try:
+                    step_args[key] = mask_numeric_keys[key](val)
+                except (ValueError, TypeError):
+                    step_args[key] = val
+            elif ' ' in val and key not in ('face_mask_blur',):
+                step_args[key] = val.split()
+            else:
+                step_args[key] = val
+
+    return step_args
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +542,12 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
     facefusion_dir = os.path.dirname(os.path.abspath(facefusion_script))
     python_exe = sys.executable
 
+    # Read step-level config defaults from facefusion.ini so that critical
+    # keys like ``face_swapper_model`` are present in every step dict.
+    # Without this, FaceFusion's ``apply_args(step_args, state_manager.set_item)``
+    # would overwrite the init-time default with ``None``.
+    config_step_defaults = _read_config_step_args(config_path)
+
     for seg in segments:
         output_dir_abs = os.path.abspath(seg['output_dir'])
         batch_dir_abs = os.path.abspath(seg['batch_dir'])
@@ -417,13 +570,17 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 for frame_name in mb_frames:
                     frame_path = os.path.join(batch_dir_abs, frame_name)
                     output_frame = os.path.join(output_dir_abs, frame_name)
+                    step_args = {
+                        'source_paths': source_abs_list,
+                        'target_path': frame_path,
+                        'output_path': output_frame,
+                        'processors': ['face_swapper'],
+                    }
+                    # Merge config defaults (e.g. face_swapper_model) so that
+                    # apply_args does not overwrite them with None.
+                    step_args.update(config_step_defaults)
                     step = {
-                        'args': {
-                            'source_paths': source_abs_list,
-                            'target_path': frame_path,
-                            'output_path': output_frame,
-                            'processors': ['face_swapper'],
-                        },
+                        'args': step_args,
                         'status': 'queued',
                     }
                     if face_swap_debug:
