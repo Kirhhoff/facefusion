@@ -36,5 +36,5 @@ python3 "${SCRIPT_DIR}/video_face_swap.py" \
     --video "$VIDEO" \
     --start-time "$START_TIME" \
     --end-time "$END_TIME" \
-    --workers 4 \
+    --workers 48 \
     --batch-size 320
