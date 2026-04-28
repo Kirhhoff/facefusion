@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import configparser
 import json
 import os
 import re
@@ -744,7 +745,9 @@ def _write_facefusion_job_json(jobs_path: str, job_id: str, steps: list):
 
 def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
                       facefusion_script: str, work_dir: str,
-                      batch_size: int = 300, face_swap_debug: bool = False) -> str:
+                      batch_size: int = 300, face_swap_debug: bool = False,
+                      max_retries: int = 10, retry_delay: int = 5, max_retry_delay: int = 60,
+                      video_memory_strategy: str = 'tolerant') -> str:
     """
     Run FaceFusion on keyframes only (turbo mode).
 
@@ -800,7 +803,8 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
     script_path = os.path.join(work_dir, 'run_keyframe_worker.sh')
     with open(script_path, 'w') as f:
         f.write('#!/bin/bash\n')
-        f.write(f'cd "{facefusion_dir}"\n\n')
+        f.write(f'cd "{facefusion_dir}"\n')
+        f.write('exec 2>&1\n\n')
         for mb_idx, mb_frames in enumerate(mini_batches):
             jobs_path = os.path.join(work_dir, f'jobs_keyframes_{mb_idx}')
             mb_job_id = f'keyframes-mb-{mb_idx}'
@@ -817,6 +821,8 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
                     'processors': ['face_swapper'],
                 }
                 step_args.update(config_step_defaults)
+                # Override video_memory_strategy
+                step_args['video_memory_strategy'] = video_memory_strategy
                 step = {
                     'args': step_args,
                     'status': 'queued',
@@ -831,13 +837,37 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
                 f'echo "[Keyframe Worker] mini-batch {mb_idx + 1}/{len(mini_batches)}'
                 f' ({len(mb_frames)} keyframes)"\n'
             )
-            f.write(
-                f'"{python_exe}" "{facefusion_script}" job-run'
+            # Build the job-run command with video-memory-strategy
+            job_run_cmd = (
+                f'"{python_exe}" -u "{facefusion_script}" job-run'
                 f' {mb_job_id}'
                 f' --config-path "{config_abs}"'
                 f' --jobs-path "{jobs_path}"'
-                '\n\n'
+                f' --video-memory-strategy {video_memory_strategy}'
             )
+            # Retry loop with exponential backoff
+            f.write('_attempt=0\n')
+            f.write(f'_max_retries={max_retries}\n')
+            f.write(f'_retry_delay={retry_delay}\n')
+            f.write(f'_max_retry_delay={max_retry_delay}\n')
+            f.write('while true; do\n')
+            f.write(f'  {job_run_cmd}\n')
+            f.write('  _job_exit=$?\n')
+            f.write('  if [ $_job_exit -eq 0 ]; then\n')
+            f.write('    break\n')
+            f.write('  fi\n')
+            f.write('  _attempt=$((_attempt + 1))\n')
+            f.write('  if [ $_attempt -ge $_max_retries ]; then\n')
+            f.write('    echo "[Keyframe Worker] job-run FAILED after $_max_retries retries (exit code $_job_exit). Giving up."\n')
+            f.write('    exit $_job_exit\n')
+            f.write('  fi\n')
+            f.write('  _delay=$((_retry_delay * (2 ** (_attempt - 1))))\n')
+            f.write('  if [ $_delay -gt $_max_retry_delay ]; then\n')
+            f.write('    _delay=$_max_retry_delay\n')
+            f.write('  fi\n')
+            f.write('  echo "[Keyframe Worker] job-run FAILED with exit code $_job_exit. Retry $_attempt/$_max_retries in $_delay seconds..."\n')
+            f.write('  sleep $_delay\n')
+            f.write('done\n\n')
     os.chmod(script_path, 0o755)
 
     # Run the worker script (single process — keyframes are few)
@@ -914,7 +944,7 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
     return keyframes_swapped_dir
 
 
-def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False, worker_start_delay: float = 2.0) -> list:
+def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False, worker_start_delay: float = 2.0, max_retries: int = 10, retry_delay: int = 5, max_retry_delay: int = 60, video_memory_strategy: str = 'tolerant') -> list:
     """
     Launch FaceFusion worker subprocesses.
 
@@ -973,6 +1003,8 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                     # Merge config defaults (e.g. face_swapper_model) so that
                     # apply_args does not overwrite them with None.
                     step_args.update(config_step_defaults)
+                    # Override video_memory_strategy: use the determined value
+                    step_args['video_memory_strategy'] = video_memory_strategy
                     step = {
                         'args': step_args,
                         'status': 'queued',
@@ -984,83 +1016,42 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 # Write the job JSON directly into the queued directory
                 _write_facefusion_job_json(jobs_path, mb_job_id, steps)
 
-                # Shell command: run the job with error capturing
+                # Shell command: run the job with retry loop
                 f.write(
                     f'echo "[Worker {seg["worker_id"]}] mini-batch {mb_idx + 1}/{len(mini_batches)}'
                     f' ({len(mb_frames)} frames)"\n'
                 )
-                # Python health check: write a temporary Python script to avoid shell quoting issues
-                health_check_script = (
-                    'import sys, os, traceback\n'
-                    'sys.path.insert(0, os.getcwd())\n'
-                    'print("Python version: " + str(sys.version))\n'
-                    'print("Python path: " + str(sys.executable))\n'
-                    'try:\n'
-                    '    from facefusion.exit_helper import hard_exit\n'
-                    '    from facefusion.program_helper import validate_args\n'
-                    '    from facefusion.processors.core import get_processors_modules\n'
-                    '    print("Health check passed")\n'
-                    'except Exception as e:\n'
-                    '    traceback.print_exc()\n'
-                    '    print("Health check FAILED: " + str(e))\n'
-                    '    sys.exit(1)\n'
+                # Build the job-run command with video-memory-strategy
+                job_run_cmd = (
+                    f'"{python_exe}" -u "{facefusion_script}" job-run'
+                    f' {mb_job_id}'
+                    f' --config-path "{config_abs}"'
+                    f' --jobs-path "{jobs_path}"'
+                    f' --video-memory-strategy {video_memory_strategy}'
                 )
-                health_check_tmp = os.path.join(work_dir, f'health_check_{seg["worker_id"]}_{mb_idx}.py')
-                with open(health_check_tmp, 'w') as hf:
-                    hf.write(health_check_script)
-                f.write(f'"{python_exe}" "{health_check_tmp}"\n')
-                f.write('_health_exit=$?\n')
-                f.write('if [ $_health_exit -ne 0 ]; then\n')
-                f.write(f'  echo "[Worker {seg["worker_id"]}] Python health check FAILED with exit code $_health_exit"\n')
-                f.write(f'  echo "[Worker {seg["worker_id"]}] See error details above"\n')
-                f.write('  exit $_health_exit\n')
-                f.write('fi\n\n')
-                # Run job with unbuffered output and capture exit code
-                f.write(f'"{python_exe}" -u "{facefusion_script}" job-run'
-                        f' {mb_job_id}'
-                        f' --config-path "{config_abs}"'
-                        f' --jobs-path "{jobs_path}"'
-                        '\n'
-                )
-                f.write('_job_exit=$?\n')
-                f.write('if [ $_job_exit -ne 0 ]; then\n')
-                worker_id = seg["worker_id"]
-                f.write(f'  echo "[Worker {worker_id}] job-run FAILED with exit code $_job_exit"\n')
-                f.write('  # Try to capture Python traceback by re-running with verbose error\n')
-                f.write(f'  echo "[Worker {worker_id}] Retrying with verbose traceback..."\n')
-                verbose_traceback_script = (
-                    'import sys, os, traceback\n'
-                    'sys.path.insert(0, os.getcwd())\n'
-                    'try:\n'
-                    '    from facefusion.program import create_program\n'
-                    '    from facefusion.program_helper import validate_args, validate_actions\n'
-                    '    from argparse import _SubParsersAction\n'
-                    '    program = create_program()\n'
-                    '    print("=== validate_args diagnosis ===")\n'
-                    '    def diagnose(program, prefix=""):\n'
-                    '        for action in program._actions:\n'
-                    '            if action.default and action.choices:\n'
-                    '                if isinstance(action.default, list):\n'
-                    '                    for d in action.default:\n'
-                    '                        if d not in action.choices:\n'
-                    '                            print(f"{prefix}FAIL: --{action.dest} default={d!r} not in choices={action.choices}")\n'
-                    '                elif action.default not in action.choices:\n'
-                    '                    print(f"{prefix}FAIL: --{action.dest} default={action.default!r} not in choices={action.choices}")\n'
-                    '            if isinstance(action, _SubParsersAction):\n'
-                    '                for name, sub_prog in action._name_parser_map.items():\n'
-                    '                    diagnose(sub_prog, prefix=f"{name}: ")\n'
-                    '    diagnose(program)\n'
-                    '    result = validate_args(program)\n'
-                    '    print(f"validate_args result: {result}")\n'
-                    'except Exception as e:\n'
-                    '    traceback.print_exc()\n'
-                )
-                verbose_traceback_tmp = os.path.join(work_dir, f'verbose_traceback_{worker_id}_{mb_idx}.py')
-                with open(verbose_traceback_tmp, 'w') as vf:
-                    vf.write(verbose_traceback_script)
-                f.write(f'  "{python_exe}" -u "{verbose_traceback_tmp}"\n')
-                f.write('  exit $_job_exit\n')
-                f.write('fi\n\n')
+                # Retry loop with exponential backoff
+                f.write('_attempt=0\n')
+                f.write(f'_max_retries={max_retries}\n')
+                f.write(f'_retry_delay={retry_delay}\n')
+                f.write(f'_max_retry_delay={max_retry_delay}\n')
+                f.write('while true; do\n')
+                f.write(f'  {job_run_cmd}\n')
+                f.write('  _job_exit=$?\n')
+                f.write('  if [ $_job_exit -eq 0 ]; then\n')
+                f.write('    break\n')
+                f.write('  fi\n')
+                f.write('  _attempt=$((_attempt + 1))\n')
+                f.write(f'  if [ $_attempt -ge $_max_retries ]; then\n')
+                f.write(f'    echo "[Worker {seg["worker_id"]}] job-run FAILED after $_max_retries retries (exit code $_job_exit). Giving up."\n')
+                f.write('    exit $_job_exit\n')
+                f.write('  fi\n')
+                f.write('  _delay=$((_retry_delay * (2 ** (_attempt - 1))))\n')
+                f.write('  if [ $_delay -gt $_max_retry_delay ]; then\n')
+                f.write('    _delay=$_max_retry_delay\n')
+                f.write('  fi\n')
+                f.write(f'  echo "[Worker {seg["worker_id"]}] job-run FAILED with exit code $_job_exit. Retry $_attempt/$_max_retries in $_delay seconds..."\n')
+                f.write('  sleep $_delay\n')
+                f.write('done\n\n')
         os.chmod(script_path, 0o755)
 
         log_path = os.path.join(work_dir, f'worker_{seg["worker_id"]}.log')
@@ -1428,6 +1419,9 @@ Examples:
     parser.add_argument('--video-crf', type=int, default=23, help='CRF value for libx264/h264_nvenc (18-28, default: 23). Lower = better quality but larger files.')
     parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
     parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay in seconds between launching each worker subprocess to avoid GPU memory allocation spikes (default: 2.0, set 0 to disable)')
+    parser.add_argument('--max-retries', type=int, default=10, help='Max retry attempts for each mini-batch on failure (default: 10)')
+    parser.add_argument('--retry-delay', type=int, default=5, help='Initial retry delay in seconds with exponential backoff (default: 5)')
+    parser.add_argument('--max-retry-delay', type=int, default=60, help='Maximum retry delay in seconds (default: 60)')
 
     args = parser.parse_args()
 
@@ -1469,6 +1463,15 @@ Examples:
         video_ext = os.path.splitext(os.path.basename(args.video))[1] or '.mp4'
         output_path = os.path.join(work_dir, f'{video_stem}_{source_stem}_output{video_ext}')
 
+    # Determine video_memory_strategy: use user config from facefusion.ini if
+    # explicitly set, otherwise default to 'tolerant' for better GPU stability.
+    _config = configparser.ConfigParser()
+    _config.read(args.config_path)
+    _ini_vms = _config.get('memory', 'video_memory_strategy', fallback='').strip()
+    video_memory_strategy = _ini_vms if _ini_vms else 'tolerant'
+    print(f'[Info] Video memory strategy: {video_memory_strategy}'
+          f'{" (from facefusion.ini)" if _ini_vms else " (default — not set in facefusion.ini)"}')
+
     print('=' * 70)
     print('  Video Face-Swap Pipeline')
     if args.turbo_mode:
@@ -1485,6 +1488,8 @@ Examples:
     print(f'  Turbo mode:   {args.turbo_mode}')
     print(f'  Frame quality: {args.frame_quality} (JPEG)')
     print(f'  Video encoder: {args.video_encoder} (CRF={args.video_crf}, preset={args.video_preset})')
+    print(f'  GPU strategy: {video_memory_strategy}')
+    print(f'  Max retries:  {args.max_retries} (delay={args.retry_delay}s, max_delay={args.max_retry_delay}s)')
     print('=' * 70)
 
     start_total = time.time()
@@ -1517,6 +1522,10 @@ Examples:
             facefusion_script, work_dir, args.batch_size,
             face_swap_debug=args.face_swap_debug,
             worker_start_delay=args.worker_start_delay,
+            max_retries=args.max_retries,
+            retry_delay=args.retry_delay,
+            max_retry_delay=args.max_retry_delay,
+            video_memory_strategy=video_memory_strategy,
         )
 
         # Step 4 (turbo): Monitor progress
@@ -1612,7 +1621,7 @@ Examples:
     segments = split_frames_into_segments(frames_dir, work_dir, args.workers)
 
     # Step 3: Launch workers
-    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size, face_swap_debug=args.face_swap_debug, worker_start_delay=args.worker_start_delay)
+    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size, face_swap_debug=args.face_swap_debug, worker_start_delay=args.worker_start_delay, max_retries=args.max_retries, retry_delay=args.retry_delay, max_retry_delay=args.max_retry_delay, video_memory_strategy=video_memory_strategy)
 
     # Step 4: Monitor progress
     print(f'[Step 4] Monitoring progress ...')
