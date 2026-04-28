@@ -991,7 +991,8 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 )
                 # Python health check: write a temporary Python script to avoid shell quoting issues
                 health_check_script = (
-                    'import sys, traceback\n'
+                    'import sys, os, traceback\n'
+                    'sys.path.insert(0, os.getcwd())\n'
                     'print("Python version: " + str(sys.version))\n'
                     'print("Python path: " + str(sys.executable))\n'
                     'try:\n'
@@ -1028,8 +1029,8 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 f.write('  # Try to capture Python traceback by re-running with verbose error\n')
                 f.write(f'  echo "[Worker {worker_id}] Retrying with verbose traceback..."\n')
                 verbose_traceback_script = (
-                    'import sys, traceback\n'
-                    'sys.path.insert(0, r"' + facefusion_dir + '")\n'
+                    'import sys, os, traceback\n'
+                    'sys.path.insert(0, os.getcwd())\n'
                     'try:\n'
                     '    from facefusion.core import cli\n'
                     '    print("cli import succeeded")\n'
