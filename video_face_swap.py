@@ -169,7 +169,7 @@ def _read_config_step_args(config_path: str) -> dict:
 # Step 1: Extract frames & audio
 # ---------------------------------------------------------------------------
 
-def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_time: str = None, turbo_mode: bool = False) -> tuple:
+def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_time: str = None, turbo_mode: bool = False, frame_quality: int = 95) -> tuple:
     """
     Extract video frames as JPEG images and audio track.
 
@@ -204,13 +204,13 @@ def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_t
             '-i', video_path,
             '-vf', "select=eq(pict_type\\,I)",
             '-vsync', 'vfr',
-            '-qmin', '1', '-q:v', '1',  # high quality PNG
-            os.path.join(keyframes_dir, 'frame_%08d.png')
+            '-q:v', str(round(31 - (frame_quality * 0.31))),  # map 1-100 quality to ffmpeg q:v scale (2=best, 31=worst)
+            os.path.join(keyframes_dir, 'frame_%08d.jpg')
         ]
         print(f'[Step 1] [Turbo Mode] Extracting keyframes (I-frames) ...')
         run_cmd(cmd)
 
-        keyframe_count = len(glob(os.path.join(keyframes_dir, 'frame_*.png')))
+        keyframe_count = len(glob(os.path.join(keyframes_dir, 'frame_*.jpg')))
         print(f'[Step 1] [Turbo Mode] Extracted {keyframe_count} keyframes')
 
         if keyframe_count == 0:
@@ -246,13 +246,13 @@ def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_t
         cmd += [
             '-i', video_path,
             '-vsync', '0',
-            '-qmin', '1', '-q:v', '1',  # high quality PNG
-            os.path.join(frames_dir, 'frame_%08d.png')
+            '-q:v', str(round(31 - (frame_quality * 0.31))),  # map 1-100 quality to ffmpeg q:v scale (2=best, 31=worst)
+            os.path.join(frames_dir, 'frame_%08d.jpg')
         ]
         print(f'[Step 1] Extracting frames ...')
         run_cmd(cmd)
 
-        frame_count = len(glob(os.path.join(frames_dir, 'frame_*.png')))
+        frame_count = len(glob(os.path.join(frames_dir, 'frame_*.jpg')))
         print(f'[Step 1] Extracted {frame_count} frames')
 
         # --- Extract audio ---
@@ -392,7 +392,7 @@ def detect_keyframe_indices(video_path: str, start_time: str = None, end_time: s
     ---------------------
     Packets are enumerated in decode order starting from 1 so that the
     indices align with the extracted frame numbering
-    (``frame_00000001.png`` is index 1).
+    (``frame_00000001.jpg`` is index 1).
 
     Returns
     -------
@@ -484,7 +484,7 @@ def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set,
     ---------------------
     ``keyframe_indices`` are 1-based indices into the *source video* (as
     reported by ffprobe).  However, when ``start_time`` is specified the
-    extracted frames in ``frames_dir`` start from ``frame_00000001.png``,
+    extracted frames in ``frames_dir`` start from ``frame_00000001.jpg``,
     which corresponds to the first frame *within the time range*, not the
     first frame of the video.  We must therefore convert video-frame indices
     to extracted-frame indices.
@@ -502,7 +502,7 @@ def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set,
     keyframes_orig_dir = os.path.join(work_dir, 'keyframes_original')
     os.makedirs(keyframes_orig_dir, exist_ok=True)
 
-    all_frames = sorted(glob(os.path.join(frames_dir, 'frame_*.png')))
+    all_frames = sorted(glob(os.path.join(frames_dir, 'frame_*.jpg')))
     total_extracted = len(all_frames)
 
     if total_extracted == 0:
@@ -568,13 +568,13 @@ def find_output_frame(output_dir: str, frame_name: str) -> str | None:
     Find the actual output file for a given frame in the output directory.
 
     FaceFusion may leave processed frames with a temporary filename pattern
-    (e.g. ``frame_00000001-worker-0-mb-0-0.png``) when the job is not fully
+    (e.g. ``frame_00000001-worker-0-mb-0-0.jpg``) when the job is not fully
     finalized.  This function looks for both the original name and the
     temporary-name variant, preferring the original.
 
     Args:
         output_dir: The worker output directory to search in.
-        frame_name: The original frame filename (e.g. ``frame_00000001.png``).
+        frame_name: The original frame filename (e.g. ``frame_00000001.jpg``).
 
     Returns:
         The absolute path to the found file, or ``None`` if neither the
@@ -585,10 +585,10 @@ def find_output_frame(output_dir: str, frame_name: str) -> str | None:
     if os.path.exists(original_path):
         return original_path
 
-    # Priority 2: temporary filename  frame_XXXXXXXX-worker-*-mb-*.png
+    # Priority 2: temporary filename  frame_XXXXXXXX-worker-*-mb-*.jpg
     # Extract the numeric part from the original frame name
     base = os.path.splitext(frame_name)[0]          # e.g. frame_00000001
-    # The temporary pattern is: {base}-worker-{W}-mb-{M}-{S}.png
+    # The temporary pattern is: {base}-worker-{W}-mb-{M}-{S}.jpg
     pattern = re.compile(rf'^{re.escape(base)}-worker-\d+-mb-\d+-\d+\{os.path.splitext(frame_name)[1]}$')
     try:
         for entry in os.listdir(output_dir):
@@ -604,7 +604,7 @@ def collect_swapped_keyframes(segments: list, work_dir: str, keyframe_names: lis
     """
     After face-swapping, symlink the swapped versions of keyframes into keyframes_swapped/.
     Zero extra computation — just picks from existing output.
-    Supports FaceFusion temporary filename pattern (frame_XXXXXXXX-worker-X-mb-X-X.png).
+    Supports FaceFusion temporary filename pattern (frame_XXXXXXXX-worker-X-mb-X-X.jpg).
     """
     keyframes_swap_dir = os.path.join(work_dir, 'keyframes_swapped')
     os.makedirs(keyframes_swap_dir, exist_ok=True)
@@ -645,7 +645,7 @@ def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -
     Creates batch_N/ directories with symlinks.
     Returns list of dicts: {batch_dir, output_dir, frame_count, frame_names}
     """
-    all_frames = sorted(glob(os.path.join(frames_dir, 'frame_*.png')))
+    all_frames = sorted(glob(os.path.join(frames_dir, 'frame_*.jpg')))
     total = len(all_frames)
 
     if total == 0:
@@ -694,7 +694,7 @@ def split_frames_into_segments(frames_dir: str, work_dir: str, n_workers: int) -
         first = seg['frame_names'][0] if seg['frame_names'] else '?'
         last = seg['frame_names'][-1] if seg['frame_names'] else '?'
         # Verify symlinks actually exist
-        batch_files = sorted(glob(os.path.join(seg['batch_dir'], 'frame_*.png')))
+        batch_files = sorted(glob(os.path.join(seg['batch_dir'], 'frame_*.jpg')))
         print(f'  Worker {seg["worker_id"]}: {seg["frame_count"]} frames ({first} ~ {last}), '
               f'batch_dir has {len(batch_files)} files')
 
@@ -777,7 +777,7 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
     keyframes_swapped_dir = os.path.join(work_dir, 'keyframes_swapped')
     os.makedirs(keyframes_swapped_dir, exist_ok=True)
 
-    all_keyframes = sorted(glob(os.path.join(keyframes_dir, 'frame_*.png')))
+    all_keyframes = sorted(glob(os.path.join(keyframes_dir, 'frame_*.jpg')))
     if not all_keyframes:
         print('[Error] No keyframe images found in ' + keyframes_dir)
         return keyframes_swapped_dir
@@ -875,14 +875,14 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
         )
         prev_count = 0
         while proc.poll() is None:
-            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.jpg')))
             delta = count - prev_count
             if delta > 0:
                 bar.update(delta)
                 prev_count = count
             time.sleep(1.0)
         # Final count
-        count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+        count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.jpg')))
         delta = count - prev_count
         if delta > 0:
             bar.update(delta)
@@ -890,7 +890,7 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
         print()
     except ImportError:
         while proc.poll() is None:
-            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+            count = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.jpg')))
             print(f'\r[Progress] Keyframes: {count}/{len(all_keyframes)}', end='', flush=True)
             time.sleep(2.0)
         print()
@@ -908,7 +908,7 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
                     print(f'  {line}', end='')
                 print('---')
 
-    processed = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+    processed = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.jpg')))
     print(f'[Step 2] [Turbo Mode] Processed {processed}/{len(all_keyframes)} keyframes')
 
     return keyframes_swapped_dir
@@ -1076,7 +1076,7 @@ def monitor_progress(segments: list, processes: list):
             overall_count = 0
 
             for i, seg in enumerate(segments):
-                count = len(glob(os.path.join(seg['output_dir'], 'frame_*.png')))
+                count = len(glob(os.path.join(seg['output_dir'], 'frame_*.jpg')))
                 delta = count - prev_counts[i]
                 if delta > 0:
                     bars[i].update(delta)
@@ -1090,11 +1090,11 @@ def monitor_progress(segments: list, processes: list):
             if all_done:
                 # Final count update
                 for i, seg in enumerate(segments):
-                    count = len(glob(os.path.join(seg['output_dir'], 'frame_*.png')))
+                    count = len(glob(os.path.join(seg['output_dir'], 'frame_*.jpg')))
                     delta = count - prev_counts[i]
                     if delta > 0:
                         bars[i].update(delta)
-                overall_final = sum(len(glob(os.path.join(seg['output_dir'], 'frame_*.png'))) for seg in segments)
+                overall_final = sum(len(glob(os.path.join(seg['output_dir'], 'frame_*.jpg'))) for seg in segments)
                 overall_delta = overall_final - overall_bar.n
                 if overall_delta > 0:
                     overall_bar.update(overall_delta)
@@ -1115,7 +1115,7 @@ def monitor_progress(segments: list, processes: list):
             status_parts = []
             overall = 0
             for seg in segments:
-                count = len(glob(os.path.join(seg['output_dir'], 'frame_*.png')))
+                count = len(glob(os.path.join(seg['output_dir'], 'frame_*.jpg')))
                 status_parts.append(f'W{seg["worker_id"]}:{count}/{seg["frame_count"]}')
                 overall += count
             print(f'\r[Progress] {" | ".join(status_parts)} | Total: {overall}/{total_frames}', end='', flush=True)
@@ -1150,8 +1150,8 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
         out_dir = seg['output_dir']
         if os.path.isdir(out_dir):
             entries = os.listdir(out_dir)
-            original_count = sum(1 for e in entries if re.match(r'^frame_\d{8}\.png$', e))
-            temp_count = sum(1 for e in entries if re.match(r'^frame_\d{8}-worker-\d+-mb-\d+-\d+\.png$', e))
+            original_count = sum(1 for e in entries if re.match(r'^frame_\d{8}\.jpg$', e))
+            temp_count = sum(1 for e in entries if re.match(r'^frame_\d{8}-worker-\d+-mb-\d+-\d+\.jpg$', e))
             print(f'  [Diag] {out_dir}: {len(entries)} files '
                   f'(original-name: {original_count}, temp-name: {temp_count}, other: {len(entries) - original_count - temp_count})')
 
@@ -1187,7 +1187,7 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
                     continue
 
             # Create sequentially numbered symlink for ffmpeg
-            link_name = f'frame_{frame_idx:08d}.png'
+            link_name = f'frame_{frame_idx:08d}.jpg'
             link_path = os.path.join(ordered_dir, link_name)
             if not os.path.exists(link_path):
                 os.symlink(os.path.abspath(src), link_path)
@@ -1209,7 +1209,7 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
     cmd = [
         'ffmpeg', '-y',
         '-framerate', str(fps),
-        '-i', os.path.join(ordered_dir, 'frame_%08d.png'),
+        '-i', os.path.join(ordered_dir, 'frame_%08d.jpg'),
     ]
 
     if audio_path and os.path.exists(audio_path):
@@ -1360,8 +1360,8 @@ Examples:
     parser.add_argument('--frame-quality', type=int, default=95, help='JPEG quality for extracted frames (80-100, default: 95). Higher = better quality but larger files.')
     parser.add_argument('--video-encoder', default='libx264', choices=['libx264', 'mpeg4', 'h264_nvenc'], help='Video encoder for output (default: libx264). h264_nvenc requires NVIDIA GPU.')
     parser.add_argument('--video-crf', type=int, default=23, help='CRF value for libx264/h264_nvenc (18-28, default: 23). Lower = better quality but larger files.')
-parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
-parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay in seconds between launching each worker subprocess to avoid GPU memory allocation spikes (default: 2.0, set 0 to disable)')
+    parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
+    parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay in seconds between launching each worker subprocess to avoid GPU memory allocation spikes (default: 2.0, set 0 to disable)')
 
     args = parser.parse_args()
 
@@ -1506,7 +1506,7 @@ parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay
         collect_swapped_keyframes(segments, work_dir, all_keyframe_names)
 
         keyframes_swapped_dir = os.path.join(work_dir, 'keyframes_swapped')
-        processed_keyframes = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.png')))
+        processed_keyframes = len(glob(os.path.join(keyframes_swapped_dir, 'frame_*.jpg')))
 
         # Print turbo mode summary report
         elapsed = time.time() - start_total
@@ -1596,7 +1596,7 @@ parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay
 
     # Count processed frames
     processed = sum(
-        len(glob(os.path.join(seg['output_dir'], 'frame_*.png')))
+        len(glob(os.path.join(seg['output_dir'], 'frame_*.jpg')))
         for seg in segments
     )
     expected = sum(seg['frame_count'] for seg in segments)
