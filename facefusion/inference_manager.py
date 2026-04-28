@@ -71,15 +71,25 @@ def create_inference_session(model_path : str, execution_device_id : int, execut
 	model_file_name = get_file_name(model_path)
 	start_time = time()
 
-	try:
-		inference_providers = create_inference_providers(execution_device_id, execution_providers)
-		inference_session = InferenceSession(model_path, providers = inference_providers)
-		logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
-		return inference_session
+	max_retries = 3
+	initial_delay = 2.0
+	max_delay = 10.0
 
-	except Exception:
-		logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
-		fatal_exit(1)
+	for attempt in range(max_retries + 1):
+		try:
+			inference_providers = create_inference_providers(execution_device_id, execution_providers)
+			inference_session = InferenceSession(model_path, providers = inference_providers)
+			logger.debug(translator.get('loading_model_succeeded').format(model_name = model_file_name, seconds = calculate_end_time(start_time)), __name__)
+			return inference_session
+
+		except Exception as exception:
+			if attempt < max_retries:
+				delay = min(initial_delay * (2 ** attempt), max_delay)
+				logger.warn(f'Loading model {model_file_name} failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s: {exception}', __name__)
+				sleep(delay)
+			else:
+				logger.error(translator.get('loading_model_failed').format(model_name = model_file_name), __name__)
+				fatal_exit(1)
 
 
 def get_inference_context(module_name : str, model_names : List[str], execution_device_id : int, execution_providers : List[ExecutionProvider]) -> str:

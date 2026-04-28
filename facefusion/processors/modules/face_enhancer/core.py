@@ -328,9 +328,10 @@ def post_process() -> None:
 	read_static_image.cache_clear()
 	read_static_video_frame.cache_clear()
 	video_manager.clear_video_pool()
-	if state_manager.get_item('video_memory_strategy') in [ 'strict', 'moderate' ]:
+	video_memory_strategy = state_manager.get_item('video_memory_strategy')
+	if video_memory_strategy in [ 'strict', 'moderate' ]:
 		clear_inference_pool()
-	if state_manager.get_item('video_memory_strategy') == 'strict':
+	if video_memory_strategy == 'strict':
 		content_analyser.clear_inference_pool()
 		face_classifier.clear_inference_pool()
 		face_detector.clear_inference_pool()

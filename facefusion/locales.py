@@ -160,6 +160,7 @@ LOCALES : Locales =\
 			'execution_device_ids': 'specify the devices used for processing',
 			'execution_providers': 'inference using different providers (choices: {choices}, ...)',
 			'execution_thread_count': 'specify the amount of parallel threads while processing',
+			'gpu_mem_limit': 'limit the GPU memory usage per ONNX session in GB (0 = no limit)',
 			'video_memory_strategy': 'balance fast processing and low VRAM usage',
 			'system_memory_limit': 'limit the available RAM that can be used while processing',
 			'log_level': 'adjust the message severity displayed in the terminal',

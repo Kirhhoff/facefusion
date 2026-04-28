@@ -36,11 +36,16 @@ def create_inference_providers(execution_device_id : int, execution_providers : 
 
 	for execution_provider in execution_providers:
 		if execution_provider == 'cuda':
-			inference_providers.append((facefusion.choices.execution_provider_set.get(execution_provider),
+			cuda_option_set : InferenceOptionSet =\
 			{
 				'device_id': execution_device_id,
-				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search()
-			}))
+				'cudnn_conv_algo_search': resolve_cudnn_conv_algo_search(),
+				'arena_extend_strategy': 'kSameAsRequested',
+			}
+			gpu_mem_limit = resolve_gpu_mem_limit()
+			if gpu_mem_limit > 0:
+				cuda_option_set['gpu_mem_limit'] = gpu_mem_limit
+			inference_providers.append((facefusion.choices.execution_provider_set.get(execution_provider), cuda_option_set))
 
 		if execution_provider == 'tensorrt':
 			inference_option_set : InferenceOptionSet =\
@@ -121,6 +126,19 @@ def resolve_cudnn_conv_algo_search() -> str:
 			return 'DEFAULT'
 
 	return 'EXHAUSTIVE'
+
+
+def resolve_gpu_mem_limit() -> int:
+	"""Resolve the GPU memory limit in bytes from state manager.
+
+	Returns 0 (no limit) if the value is not set or is 0.
+	The value is stored in GB and converted to bytes.
+	"""
+	from facefusion import state_manager
+	gpu_mem_limit_gb = state_manager.get_item('gpu_mem_limit') or 0
+	if gpu_mem_limit_gb > 0:
+		return int(gpu_mem_limit_gb * 1024 * 1024 * 1024)
+	return 0
 
 
 def resolve_openvino_device_type(execution_device_id : int) -> str:

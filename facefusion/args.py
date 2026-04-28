@@ -72,6 +72,7 @@ def apply_args(args : Args, apply_state_item : ApplyStateItem) -> None:
 	apply_state_item('execution_device_ids', args.get('execution_device_ids'))
 	apply_state_item('execution_providers', args.get('execution_providers'))
 	apply_state_item('execution_thread_count', args.get('execution_thread_count'))
+	apply_state_item('gpu_mem_limit', args.get('gpu_mem_limit'))
 	apply_state_item('download_providers', args.get('download_providers'))
 	apply_state_item('download_scope', args.get('download_scope'))
 	apply_state_item('benchmark_mode', args.get('benchmark_mode'))

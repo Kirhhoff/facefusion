@@ -914,7 +914,7 @@ def process_keyframes(keyframes_dir: str, source_paths: list, config_path: str,
     return keyframes_swapped_dir
 
 
-def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False) -> list:
+def launch_workers(segments: list, source_paths: list, config_path: str, facefusion_script: str, work_dir: str, batch_size: int = 300, face_swap_debug: bool = False, worker_start_delay: float = 2.0) -> list:
     """
     Launch FaceFusion worker subprocesses.
 
@@ -1022,6 +1022,11 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
         proc._log_file = log_file
         proc._worker_id = seg['worker_id']
         processes.append(proc)
+
+        # Stagger worker launches to avoid GPU memory allocation spikes
+        if worker_start_delay > 0 and seg != segments[-1]:
+            print(f'  Waiting {worker_start_delay}s before launching next worker...')
+            time.sleep(worker_start_delay)
 
     return processes
 
@@ -1355,7 +1360,8 @@ Examples:
     parser.add_argument('--frame-quality', type=int, default=95, help='JPEG quality for extracted frames (80-100, default: 95). Higher = better quality but larger files.')
     parser.add_argument('--video-encoder', default='libx264', choices=['libx264', 'mpeg4', 'h264_nvenc'], help='Video encoder for output (default: libx264). h264_nvenc requires NVIDIA GPU.')
     parser.add_argument('--video-crf', type=int, default=23, help='CRF value for libx264/h264_nvenc (18-28, default: 23). Lower = better quality but larger files.')
-    parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
+parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
+parser.add_argument('--worker-start-delay', type=float, default=2.0, help='Delay in seconds between launching each worker subprocess to avoid GPU memory allocation spikes (default: 2.0, set 0 to disable)')
 
     args = parser.parse_args()
 
@@ -1444,6 +1450,7 @@ Examples:
             segments, args.source, args.config_path,
             facefusion_script, work_dir, args.batch_size,
             face_swap_debug=args.face_swap_debug,
+            worker_start_delay=args.worker_start_delay,
         )
 
         # Step 4 (turbo): Monitor progress
@@ -1538,7 +1545,7 @@ Examples:
     segments = split_frames_into_segments(frames_dir, work_dir, args.workers)
 
     # Step 3: Launch workers
-    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size, face_swap_debug=args.face_swap_debug)
+    processes = launch_workers(segments, args.source, args.config_path, facefusion_script, work_dir, args.batch_size, face_swap_debug=args.face_swap_debug, worker_start_delay=args.worker_start_delay)
 
     # Step 4: Monitor progress
     print(f'[Step 4] Monitoring progress ...')
