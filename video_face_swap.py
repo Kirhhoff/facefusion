@@ -983,7 +983,7 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                 # Write the job JSON directly into the queued directory
                 _write_facefusion_job_json(jobs_path, mb_job_id, steps)
 
-                # Shell command: just run the job
+                # Shell command: run the job with error capturing
                 f.write(
                     f'echo "[Worker {seg["worker_id"]}] mini-batch {mb_idx + 1}/{len(mini_batches)}'
                     f' ({len(mb_frames)} frames)"\n'
@@ -993,12 +993,20 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                     f' {mb_job_id}'
                     f' --config-path "{config_abs}"'
                     f' --jobs-path "{jobs_path}"'
-                    '\n\n'
+                    '\n'
                 )
+                f.write('_job_exit=$?\n')
+                f.write('if [ $_job_exit -ne 0 ]; then\n')
+                worker_id = seg["worker_id"]
+                f.write(f'  echo "[Worker {worker_id}] job-run FAILED with exit code $_job_exit"\n')
+                f.write('  exit $_job_exit\n')
+                f.write('fi\n\n')
         os.chmod(script_path, 0o755)
 
         log_path = os.path.join(work_dir, f'worker_{seg["worker_id"]}.log')
+        err_log_path = os.path.join(work_dir, f'worker_{seg["worker_id"]}_stderr.log')
         log_file = open(log_path, 'w')
+        err_log_file = open(err_log_path, 'w')
 
         # Debug info
         print(f'[Step 3] Launching worker {seg["worker_id"]}: {seg["frame_count"]} frames '
@@ -1015,11 +1023,13 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
         proc = subprocess.Popen(
             ['bash', script_path],
             stdout=log_file,
-            stderr=subprocess.STDOUT,
+            stderr=err_log_file,
             cwd=facefusion_dir,
             env=env,
         )
         proc._log_file = log_file
+        proc._err_log_file = err_log_file
+        proc._err_log_path = err_log_path
         proc._worker_id = seg['worker_id']
         processes.append(proc)
 
@@ -1461,7 +1471,10 @@ Examples:
         for proc in processes:
             ret = proc.poll()
             if ret is not None and ret != 0:
-                proc._log_file.flush()
+                if hasattr(proc, '_log_file'):
+                    proc._log_file.flush()
+                if hasattr(proc, '_err_log_file'):
+                    proc._err_log_file.flush()
                 log_path = os.path.join(work_dir, f'worker_{proc._worker_id}.log')
                 print(f'\n[ERROR] Worker {proc._worker_id} exited immediately with code {ret}!')
                 print(f'--- worker_{proc._worker_id}.log ---')
@@ -1471,10 +1484,24 @@ Examples:
                         if content.strip():
                             print(content)
                         else:
-                            print('  (log is empty)')
+                            print('  (stdout log is empty)')
                 except Exception:
-                    print('  (could not read log)')
+                    print('  (could not read stdout log)')
                 print('---')
+                # Also print stderr log for diagnostics
+                err_log_path = getattr(proc, '_err_log_path', None)
+                if err_log_path:
+                    print(f'--- worker_{proc._worker_id}_stderr.log ---')
+                    try:
+                        with open(err_log_path, 'r') as f:
+                            err_content = f.read()
+                            if err_content.strip():
+                                print(err_content)
+                            else:
+                                print('  (stderr log is empty)')
+                    except Exception:
+                        print('  (could not read stderr log)')
+                    print('---')
 
         monitor_progress(segments, processes)
 
@@ -1484,6 +1511,8 @@ Examples:
             proc.wait()
             if hasattr(proc, '_log_file'):
                 proc._log_file.close()
+            if hasattr(proc, '_err_log_file'):
+                proc._err_log_file.close()
             if proc.returncode != 0:
                 failed_workers.append(proc._worker_id)
 
@@ -1494,6 +1523,14 @@ Examples:
                 if os.path.exists(log_path):
                     print(f'\n--- Last 20 lines of worker_{wid}.log ---')
                     with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                        for line in lines[-20:]:
+                            print(f'  {line}', end='')
+                    print()
+                err_log_path = os.path.join(work_dir, f'worker_{wid}_stderr.log')
+                if os.path.exists(err_log_path):
+                    print(f'\n--- Last 20 lines of worker_{wid}_stderr.log ---')
+                    with open(err_log_path, 'r') as f:
                         lines = f.readlines()
                         for line in lines[-20:]:
                             print(f'  {line}', end='')
@@ -1555,7 +1592,10 @@ Examples:
     for proc in processes:
         ret = proc.poll()
         if ret is not None and ret != 0:
-            proc._log_file.flush()
+            if hasattr(proc, '_log_file'):
+                proc._log_file.flush()
+            if hasattr(proc, '_err_log_file'):
+                proc._err_log_file.flush()
             log_path = os.path.join(work_dir, f'worker_{proc._worker_id}.log')
             print(f'\n[ERROR] Worker {proc._worker_id} exited immediately with code {ret}!')
             print(f'--- worker_{proc._worker_id}.log ---')
@@ -1565,10 +1605,24 @@ Examples:
                     if content.strip():
                         print(content)
                     else:
-                        print('  (log is empty)')
+                        print('  (stdout log is empty)')
             except Exception:
-                print('  (could not read log)')
+                print('  (could not read stdout log)')
             print('---')
+            # Also print stderr log for diagnostics
+            err_log_path = getattr(proc, '_err_log_path', None)
+            if err_log_path:
+                print(f'--- worker_{proc._worker_id}_stderr.log ---')
+                try:
+                    with open(err_log_path, 'r') as f:
+                        err_content = f.read()
+                        if err_content.strip():
+                            print(err_content)
+                        else:
+                            print('  (stderr log is empty)')
+                except Exception:
+                    print('  (could not read stderr log)')
+                print('---')
 
     monitor_progress(segments, processes)
 
@@ -1578,6 +1632,8 @@ Examples:
         proc.wait()
         if hasattr(proc, '_log_file'):
             proc._log_file.close()
+        if hasattr(proc, '_err_log_file'):
+            proc._err_log_file.close()
         if proc.returncode != 0:
             failed_workers.append(proc._worker_id)
 
@@ -1589,6 +1645,15 @@ Examples:
             if os.path.exists(log_path):
                 print(f'\n--- Last 20 lines of worker_{wid}.log ---')
                 with open(log_path, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines[-20:]:
+                        print(f'  {line}', end='')
+                print()
+            # Also print stderr log tail
+            err_log_path = os.path.join(work_dir, f'worker_{wid}_stderr.log')
+            if os.path.exists(err_log_path):
+                print(f'\n--- Last 20 lines of worker_{wid}_stderr.log ---')
+                with open(err_log_path, 'r') as f:
                     lines = f.readlines()
                     for line in lines[-20:]:
                         print(f'  {line}', end='')
