@@ -29,6 +29,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -562,31 +563,73 @@ def collect_keyframes(frames_dir: str, work_dir: str, keyframe_indices: set,
     return keyframes_orig_dir, keyframe_names
 
 
+def find_output_frame(output_dir: str, frame_name: str) -> str | None:
+    """
+    Find the actual output file for a given frame in the output directory.
+
+    FaceFusion may leave processed frames with a temporary filename pattern
+    (e.g. ``frame_00000001-worker-0-mb-0-0.png``) when the job is not fully
+    finalized.  This function looks for both the original name and the
+    temporary-name variant, preferring the original.
+
+    Args:
+        output_dir: The worker output directory to search in.
+        frame_name: The original frame filename (e.g. ``frame_00000001.png``).
+
+    Returns:
+        The absolute path to the found file, or ``None`` if neither the
+        original nor a temporary-name match exists.
+    """
+    # Priority 1: original filename
+    original_path = os.path.join(output_dir, frame_name)
+    if os.path.exists(original_path):
+        return original_path
+
+    # Priority 2: temporary filename  frame_XXXXXXXX-worker-*-mb-*.png
+    # Extract the numeric part from the original frame name
+    base = os.path.splitext(frame_name)[0]          # e.g. frame_00000001
+    # The temporary pattern is: {base}-worker-{W}-mb-{M}-{S}.png
+    pattern = re.compile(rf'^{re.escape(base)}-worker-\d+-mb-\d+-\d+\{os.path.splitext(frame_name)[1]}$')
+    try:
+        for entry in os.listdir(output_dir):
+            if pattern.match(entry):
+                return os.path.join(output_dir, entry)
+    except OSError:
+        pass
+
+    return None
+
+
 def collect_swapped_keyframes(segments: list, work_dir: str, keyframe_names: list):
     """
     After face-swapping, symlink the swapped versions of keyframes into keyframes_swapped/.
     Zero extra computation — just picks from existing output.
+    Supports FaceFusion temporary filename pattern (frame_XXXXXXXX-worker-X-mb-X-X.png).
     """
     keyframes_swap_dir = os.path.join(work_dir, 'keyframes_swapped')
     os.makedirs(keyframes_swap_dir, exist_ok=True)
 
     keyframe_set = set(keyframe_names)
     found = 0
+    temp_name_found = 0
     missing = []
 
     for seg in segments:
         for name in seg['frame_names']:
             if name in keyframe_set:
-                output_frame = os.path.join(seg['output_dir'], name)
+                result = find_output_frame(seg['output_dir'], name)
                 link_path = os.path.join(keyframes_swap_dir, name)
-                if os.path.exists(output_frame):
+                if result is not None:
                     if not os.path.exists(link_path):
-                        os.symlink(os.path.abspath(output_frame), link_path)
+                        os.symlink(os.path.abspath(result), link_path)
                     found += 1
+                    if os.path.basename(result) != name:
+                        temp_name_found += 1
                 else:
                     missing.append(name)
 
-    print(f'[Step 4.5] Collected {found}/{len(keyframe_names)} swapped keyframes → {keyframes_swap_dir}')
+    print(f'[Step 4.5] Collected {found}/{len(keyframe_names)} swapped keyframes → {keyframes_swap_dir}'
+          f'  (temp-name matches: {temp_name_found})')
     if missing:
         print(f'  [Warning] {len(missing)} keyframes were not processed by face-swap: '
               f'{missing[:5]}{"..." if len(missing) > 5 else ""}')
@@ -1086,28 +1129,45 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
     """Collect all processed frames in order and encode back to video."""
     print('[Step 5] Reassembling video ...')
 
+    # --- Diagnostic: show output directory contents ---
+    for seg in segments:
+        out_dir = seg['output_dir']
+        if os.path.isdir(out_dir):
+            entries = os.listdir(out_dir)
+            original_count = sum(1 for e in entries if re.match(r'^frame_\d{8}\.png$', e))
+            temp_count = sum(1 for e in entries if re.match(r'^frame_\d{8}-worker-\d+-mb-\d+-\d+\.png$', e))
+            print(f'  [Diag] {out_dir}: {len(entries)} files '
+                  f'(original-name: {original_count}, temp-name: {temp_count}, other: {len(entries) - original_count - temp_count})')
+
     # Collect all output frames in order
     ordered_dir = os.path.join(work_dir, 'ordered_output')
     os.makedirs(ordered_dir, exist_ok=True)
 
     frame_idx = 1
-    missing_count = 0
-    total_count = 0
+    swapped_count = 0       # frames successfully found in output (original or temp name)
+    fallback_count = 0      # frames falling back to original (not processed)
+    missing_count = 0       # frames completely missing
+    temp_name_count = 0     # subset of swapped_count that used temp-name match
 
     for seg in segments:
         for name in seg['frame_names']:
-            output_frame = os.path.join(seg['output_dir'], name)
-            # If FaceFusion output exists, use it; otherwise fall back to original frame
-            if os.path.exists(output_frame):
-                src = output_frame
+            # Use find_output_frame to support FaceFusion temporary filename pattern
+            result = find_output_frame(seg['output_dir'], name)
+            if result is not None:
+                src = result
+                swapped_count += 1
+                # Check if this was a temp-name match (for diagnostics)
+                if os.path.basename(result) != name:
+                    temp_name_count += 1
             else:
                 # Fallback: use original frame from batch_dir (symlink -> frames/)
                 original = os.path.join(seg['batch_dir'], name)
                 if os.path.exists(original):
                     src = original
-                    missing_count += 1
+                    fallback_count += 1
                 else:
                     print(f'[Warning] Frame missing: {name}')
+                    missing_count += 1
                     continue
 
             # Create sequentially numbered symlink for ffmpeg
@@ -1116,10 +1176,13 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
             if not os.path.exists(link_path):
                 os.symlink(os.path.abspath(src), link_path)
             frame_idx += 1
-            total_count += 1
 
-    if missing_count > 0:
-        print(f'[Warning] {missing_count} frames were not processed (using originals as fallback)')
+    total_count = swapped_count + fallback_count
+    print(f'[Step 5] Frame matching summary:')
+    print(f'  Total frames:        {total_count + missing_count}')
+    print(f'  Swapped (output):    {swapped_count}  (temp-name matches: {temp_name_count})')
+    print(f'  Fallback (original): {fallback_count}')
+    print(f'  Missing:             {missing_count}')
 
     print(f'[Step 5] Encoding {total_count} frames at {fps:.3f} fps ...')
 
