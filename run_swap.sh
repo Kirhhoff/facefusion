@@ -32,9 +32,9 @@ END_TIME="$3"
 python3 "${SCRIPT_DIR}/video_face_swap.py" \
     --config-path ./facefusion.ini \
     --work-base ../output/ \
-    --source ../com/2_1.jpg \
+    --source ../src/com/2_1.jpg \
     --video "$VIDEO" \
     --start-time "$START_TIME" \
     --end-time "$END_TIME" \
-    --workers 48 \
+    --workers 33 \
     --batch-size 320
