@@ -953,7 +953,8 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
         script_path = os.path.join(work_dir, f'run_worker_{seg["worker_id"]}.sh')
         with open(script_path, 'w') as f:
             f.write('#!/bin/bash\n')
-            f.write(f'cd "{facefusion_dir}"\n\n')
+            f.write(f'cd "{facefusion_dir}"\n')
+            f.write('exec 2>&1\n\n')
             for mb_idx, mb_frames in enumerate(mini_batches):
                 jobs_path = os.path.join(work_dir, f'jobs_{seg["worker_id"]}_{mb_idx}')
                 mb_job_id = f'worker-{seg["worker_id"]}-mb-{mb_idx}'
@@ -988,25 +989,63 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
                     f'echo "[Worker {seg["worker_id"]}] mini-batch {mb_idx + 1}/{len(mini_batches)}'
                     f' ({len(mb_frames)} frames)"\n'
                 )
-                f.write(
-                    f'"{python_exe}" "{facefusion_script}" job-run'
-                    f' {mb_job_id}'
-                    f' --config-path "{config_abs}"'
-                    f' --jobs-path "{jobs_path}"'
-                    '\n'
+                # Python health check: write a temporary Python script to avoid shell quoting issues
+                health_check_script = (
+                    'import sys, traceback\n'
+                    'print("Python version: " + str(sys.version))\n'
+                    'print("Python path: " + str(sys.executable))\n'
+                    'try:\n'
+                    '    from facefusion.exit_helper import hard_exit\n'
+                    '    from facefusion.program_helper import validate_args\n'
+                    '    from facefusion.processors.core import get_processors_modules\n'
+                    '    print("Health check passed")\n'
+                    'except Exception as e:\n'
+                    '    traceback.print_exc()\n'
+                    '    print("Health check FAILED: " + str(e))\n'
+                    '    sys.exit(1)\n'
+                )
+                health_check_tmp = os.path.join(work_dir, f'health_check_{seg["worker_id"]}_{mb_idx}.py')
+                with open(health_check_tmp, 'w') as hf:
+                    hf.write(health_check_script)
+                f.write(f'"{python_exe}" "{health_check_tmp}"\n')
+                f.write('_health_exit=$?\n')
+                f.write('if [ $_health_exit -ne 0 ]; then\n')
+                f.write(f'  echo "[Worker {seg["worker_id"]}] Python health check FAILED with exit code $_health_exit"\n')
+                f.write(f'  echo "[Worker {seg["worker_id"]}] See error details above"\n')
+                f.write('  exit $_health_exit\n')
+                f.write('fi\n\n')
+                # Run job with unbuffered output and capture exit code
+                f.write(f'"{python_exe}" -u "{facefusion_script}" job-run'
+                        f' {mb_job_id}'
+                        f' --config-path "{config_abs}"'
+                        f' --jobs-path "{jobs_path}"'
+                        '\n'
                 )
                 f.write('_job_exit=$?\n')
                 f.write('if [ $_job_exit -ne 0 ]; then\n')
                 worker_id = seg["worker_id"]
                 f.write(f'  echo "[Worker {worker_id}] job-run FAILED with exit code $_job_exit"\n')
+                f.write('  # Try to capture Python traceback by re-running with verbose error\n')
+                f.write(f'  echo "[Worker {worker_id}] Retrying with verbose traceback..."\n')
+                verbose_traceback_script = (
+                    'import sys, traceback\n'
+                    'sys.path.insert(0, r"' + facefusion_dir + '")\n'
+                    'try:\n'
+                    '    from facefusion.core import cli\n'
+                    '    print("cli import succeeded")\n'
+                    'except Exception as e:\n'
+                    '    traceback.print_exc()\n'
+                )
+                verbose_traceback_tmp = os.path.join(work_dir, f'verbose_traceback_{worker_id}_{mb_idx}.py')
+                with open(verbose_traceback_tmp, 'w') as vf:
+                    vf.write(verbose_traceback_script)
+                f.write(f'  "{python_exe}" -u "{verbose_traceback_tmp}"\n')
                 f.write('  exit $_job_exit\n')
                 f.write('fi\n\n')
         os.chmod(script_path, 0o755)
 
         log_path = os.path.join(work_dir, f'worker_{seg["worker_id"]}.log')
-        err_log_path = os.path.join(work_dir, f'worker_{seg["worker_id"]}_stderr.log')
         log_file = open(log_path, 'w')
-        err_log_file = open(err_log_path, 'w')
 
         # Debug info
         print(f'[Step 3] Launching worker {seg["worker_id"]}: {seg["frame_count"]} frames '
@@ -1023,13 +1062,11 @@ def launch_workers(segments: list, source_paths: list, config_path: str, facefus
         proc = subprocess.Popen(
             ['bash', script_path],
             stdout=log_file,
-            stderr=err_log_file,
+            stderr=subprocess.STDOUT,
             cwd=facefusion_dir,
             env=env,
         )
         proc._log_file = log_file
-        proc._err_log_file = err_log_file
-        proc._err_log_path = err_log_path
         proc._worker_id = seg['worker_id']
         processes.append(proc)
 
@@ -1473,8 +1510,6 @@ Examples:
             if ret is not None and ret != 0:
                 if hasattr(proc, '_log_file'):
                     proc._log_file.flush()
-                if hasattr(proc, '_err_log_file'):
-                    proc._err_log_file.flush()
                 log_path = os.path.join(work_dir, f'worker_{proc._worker_id}.log')
                 print(f'\n[ERROR] Worker {proc._worker_id} exited immediately with code {ret}!')
                 print(f'--- worker_{proc._worker_id}.log ---')
@@ -1484,24 +1519,10 @@ Examples:
                         if content.strip():
                             print(content)
                         else:
-                            print('  (stdout log is empty)')
+                            print('  (log is empty)')
                 except Exception:
-                    print('  (could not read stdout log)')
+                    print('  (could not read log)')
                 print('---')
-                # Also print stderr log for diagnostics
-                err_log_path = getattr(proc, '_err_log_path', None)
-                if err_log_path:
-                    print(f'--- worker_{proc._worker_id}_stderr.log ---')
-                    try:
-                        with open(err_log_path, 'r') as f:
-                            err_content = f.read()
-                            if err_content.strip():
-                                print(err_content)
-                            else:
-                                print('  (stderr log is empty)')
-                    except Exception:
-                        print('  (could not read stderr log)')
-                    print('---')
 
         monitor_progress(segments, processes)
 
@@ -1511,8 +1532,6 @@ Examples:
             proc.wait()
             if hasattr(proc, '_log_file'):
                 proc._log_file.close()
-            if hasattr(proc, '_err_log_file'):
-                proc._err_log_file.close()
             if proc.returncode != 0:
                 failed_workers.append(proc._worker_id)
 
@@ -1523,14 +1542,6 @@ Examples:
                 if os.path.exists(log_path):
                     print(f'\n--- Last 20 lines of worker_{wid}.log ---')
                     with open(log_path, 'r') as f:
-                        lines = f.readlines()
-                        for line in lines[-20:]:
-                            print(f'  {line}', end='')
-                    print()
-                err_log_path = os.path.join(work_dir, f'worker_{wid}_stderr.log')
-                if os.path.exists(err_log_path):
-                    print(f'\n--- Last 20 lines of worker_{wid}_stderr.log ---')
-                    with open(err_log_path, 'r') as f:
                         lines = f.readlines()
                         for line in lines[-20:]:
                             print(f'  {line}', end='')
@@ -1594,8 +1605,6 @@ Examples:
         if ret is not None and ret != 0:
             if hasattr(proc, '_log_file'):
                 proc._log_file.flush()
-            if hasattr(proc, '_err_log_file'):
-                proc._err_log_file.flush()
             log_path = os.path.join(work_dir, f'worker_{proc._worker_id}.log')
             print(f'\n[ERROR] Worker {proc._worker_id} exited immediately with code {ret}!')
             print(f'--- worker_{proc._worker_id}.log ---')
@@ -1605,24 +1614,10 @@ Examples:
                     if content.strip():
                         print(content)
                     else:
-                        print('  (stdout log is empty)')
+                        print('  (log is empty)')
             except Exception:
-                print('  (could not read stdout log)')
+                print('  (could not read log)')
             print('---')
-            # Also print stderr log for diagnostics
-            err_log_path = getattr(proc, '_err_log_path', None)
-            if err_log_path:
-                print(f'--- worker_{proc._worker_id}_stderr.log ---')
-                try:
-                    with open(err_log_path, 'r') as f:
-                        err_content = f.read()
-                        if err_content.strip():
-                            print(err_content)
-                        else:
-                            print('  (stderr log is empty)')
-                except Exception:
-                    print('  (could not read stderr log)')
-                print('---')
 
     monitor_progress(segments, processes)
 
@@ -1632,8 +1627,6 @@ Examples:
         proc.wait()
         if hasattr(proc, '_log_file'):
             proc._log_file.close()
-        if hasattr(proc, '_err_log_file'):
-            proc._err_log_file.close()
         if proc.returncode != 0:
             failed_workers.append(proc._worker_id)
 
