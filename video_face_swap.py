@@ -171,7 +171,7 @@ def _read_config_step_args(config_path: str) -> dict:
 
 def extract_frames(video_path: str, work_dir: str, start_time: str = None, end_time: str = None, turbo_mode: bool = False) -> tuple:
     """
-    Extract video frames as PNG images and audio track.
+    Extract video frames as JPEG images and audio track.
 
     In normal mode: extracts ALL frames to ``frames/``.
     In turbo mode:  extracts ONLY keyframes (I-frames) to ``keyframes_original/``.
@@ -1125,8 +1125,19 @@ def monitor_progress(segments: list, processes: list):
 # Step 5: Reassemble video
 # ---------------------------------------------------------------------------
 
-def reassemble_video(segments: list, output_path: str, fps: float, audio_path: str = None, work_dir: str = None):
-    """Collect all processed frames in order and encode back to video."""
+def reassemble_video(segments: list, output_path: str, fps: float, audio_path: str = None, work_dir: str = None,
+                     video_encoder: str = 'libx264', video_crf: int = 23, video_preset: str = 'medium'):
+    """Collect all processed frames in order and encode back to video.
+
+    Parameters
+    ----------
+    video_encoder : str
+        Video encoder: ``libx264`` (default), ``mpeg4``, or ``h264_nvenc``.
+    video_crf : int
+        CRF value for libx264 (18-28, lower = better quality, default 23).
+    video_preset : str
+        Encoding preset for libx264 or h264_nvenc.
+    """
     print('[Step 5] Reassembling video ...')
 
     # --- Diagnostic: show output directory contents ---
@@ -1199,15 +1210,35 @@ def reassemble_video(segments: list, output_path: str, fps: float, audio_path: s
     if audio_path and os.path.exists(audio_path):
         cmd += ['-i', audio_path, '-c:a', 'aac', '-shortest']
 
-    cmd += [
-        '-c:v', 'mpeg4',
-        '-qscale:v', '2',
-        '-pix_fmt', 'yuv420p',
-        output_path
-    ]
+    # Build video encoding arguments based on encoder choice
+    if video_encoder == 'h264_nvenc':
+        # NVIDIA hardware encoder: use -preset (p1-p7) and -cq (const quality)
+        cmd += [
+            '-c:v', 'h264_nvenc',
+            '-preset', video_preset if video_preset.startswith('p') else 'p4',
+            '-cq', str(video_crf),
+            '-pix_fmt', 'yuv420p',
+            output_path,
+        ]
+    elif video_encoder == 'mpeg4':
+        cmd += [
+            '-c:v', 'mpeg4',
+            '-qscale:v', '2',
+            '-pix_fmt', 'yuv420p',
+            output_path,
+        ]
+    else:
+        # Default: libx264 with CRF mode
+        cmd += [
+            '-c:v', 'libx264',
+            '-crf', str(video_crf),
+            '-preset', video_preset,
+            '-pix_fmt', 'yuv420p',
+            output_path,
+        ]
 
     run_cmd(cmd)
-    print(f'[Step 5] Output video saved to: {output_path}')
+    print(f'[Step 5] Output video saved to: {output_path} (encoder={video_encoder}, crf={video_crf}, preset={video_preset})')
 
 
 # ---------------------------------------------------------------------------
@@ -1321,6 +1352,10 @@ Examples:
     parser.add_argument('--batch-size', type=int, default=300, help='Frames per mini-batch inside each worker (default: 300)')
     parser.add_argument('--turbo-mode', action='store_true', help='Turbo mode: extract only keyframes and skip video reassembly for quick preview')
     parser.add_argument('--face-swap-debug', action='store_true', help='Enable face swap debug prints in FaceFusion workers')
+    parser.add_argument('--frame-quality', type=int, default=95, help='JPEG quality for extracted frames (80-100, default: 95). Higher = better quality but larger files.')
+    parser.add_argument('--video-encoder', default='libx264', choices=['libx264', 'mpeg4', 'h264_nvenc'], help='Video encoder for output (default: libx264). h264_nvenc requires NVIDIA GPU.')
+    parser.add_argument('--video-crf', type=int, default=23, help='CRF value for libx264/h264_nvenc (18-28, default: 23). Lower = better quality but larger files.')
+    parser.add_argument('--video-preset', default='medium', help='Encoding preset for libx264 (ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow) or h264_nvenc (p1-p7). Default: medium')
 
     args = parser.parse_args()
 
@@ -1376,6 +1411,8 @@ Examples:
     print(f'  Work dir:     {work_dir}')
     print(f'  Config:       {args.config_path}')
     print(f'  Turbo mode:   {args.turbo_mode}')
+    print(f'  Frame quality: {args.frame_quality} (JPEG)')
+    print(f'  Video encoder: {args.video_encoder} (CRF={args.video_crf}, preset={args.video_preset})')
     print('=' * 70)
 
     start_total = time.time()
@@ -1387,7 +1424,7 @@ Examples:
         # Step 1 (turbo): Extract only keyframes
         result = extract_frames(
             args.video, work_dir, args.start_time, args.end_time,
-            turbo_mode=True,
+            turbo_mode=True, frame_quality=args.frame_quality,
         )
         keyframes_dir, _, fps, keyframe_count, total_frame_count = result
 
@@ -1482,7 +1519,8 @@ Examples:
 
     # Step 1: Extract frames
     frames_dir, audio_path, fps = extract_frames(
-        args.video, work_dir, args.start_time, args.end_time
+        args.video, work_dir, args.start_time, args.end_time,
+        frame_quality=args.frame_quality,
     )
 
     # Step 1.5: Detect keyframes and collect originals
@@ -1565,7 +1603,10 @@ Examples:
     collect_swapped_keyframes(segments, work_dir, keyframe_names)
 
     # Step 5: Reassemble
-    reassemble_video(segments, output_path, fps, audio_path, work_dir)
+    reassemble_video(segments, output_path, fps, audio_path, work_dir,
+                                 video_encoder=args.video_encoder,
+                                 video_crf=args.video_crf,
+                                 video_preset=args.video_preset)
 
     elapsed = time.time() - start_total
     print()
